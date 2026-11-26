@@ -247,7 +247,7 @@ impl ProvingKeys {
 /// Cap on sends queued behind an in-flight proof (`[spend] pipeline_proving`). Each queued send
 /// is a blocked RPC handler, so the work-queue semaphore already bounds this; the cap is a
 /// defensive backstop so a misconfigured client can't grow the queue without limit. Past it,
-/// `begin_or_queue_send` sheds with `-4` back-pressure (the caller retries), like the async-op
+/// the queue sheds with `-4` back-pressure (the caller retries), like the async-op
 /// registry's inflight cap.
 const MAX_QUEUED_SENDS: usize = 64;
 
@@ -259,13 +259,34 @@ struct PendingSend {
     request: TransactionRequest,
     confirmations: Option<ConfirmationsPolicy>,
     privacy: SendPrivacy,
-    /// The funding source, carried so a send that waited in the queue selects its inputs from
-    /// the same pools it would have selected from had it started immediately. A queued send is
-    /// always shielded-sourced (`begin_or_queue_send` routes transparent ones inline), but
-    /// "shielded" is not one thing: `ANY_SAPLING` and `ANY_ORCHARD` each name one pool family,
-    /// and dropping that here would silently widen the selection back to every pool.
     source: SendSource,
     reply: oneshot::Sender<Result<TxId, RpcError>>,
+}
+
+/// All sends wait here in arrival order while a proof holds uncommitted inputs.
+#[derive(Default)]
+struct SendQueue {
+    pending: VecDeque<PendingSend>,
+    proof_in_flight: bool,
+}
+
+impl SendQueue {
+    fn push(&mut self, send: PendingSend) {
+        if self.pending.len() >= MAX_QUEUED_SENDS {
+            let _ = send.reply.send(Err(RpcError::wallet(format!(
+                "too many sends queued behind an in-flight proof ({MAX_QUEUED_SENDS}); retry shortly"
+            ))));
+        } else {
+            self.pending.push_back(send);
+        }
+    }
+
+    fn pop_ready(&mut self) -> Option<PendingSend> {
+        if self.proof_in_flight {
+            return None;
+        }
+        self.pending.pop_front()
+    }
 }
 
 /// A send whose prove+sign finished on a blocking thread, routed back to the actor so phase C
@@ -1180,11 +1201,7 @@ struct WalletActor {
     /// `[spend] shutdown_drain_secs`: how long to finish already-accepted sends once shutdown is
     /// signalled. See [`Self::finish_accepted_sends`].
     shutdown_drain: Duration,
-    /// Whether a pipelined send's proof is currently running on a blocking thread. While `true`,
-    /// new sends queue (in [`Self::send_queue`]) rather than starting - sends stay serialized.
-    send_in_flight: bool,
-    /// Sends deferred behind the in-flight proof, started in FIFO order as each one commits.
-    send_queue: VecDeque<PendingSend>,
+    send_queue: SendQueue,
     /// Loopback channel: the off-actor proof job posts its [`SendCompletion`] here, and the
     /// actor's command loop drains it to run phase C on the single writer.
     send_done_tx: mpsc::Sender<SendCompletion>,
@@ -1780,8 +1797,7 @@ async fn spawn_inner(
         shutdown_drain: cfg.shutdown_drain,
         trust_own_transactions: cfg.trust_own_transactions,
         max_send_catchup_blocks: cfg.max_send_catchup_blocks,
-        send_in_flight: false,
-        send_queue: VecDeque::new(),
+        send_queue: SendQueue::default(),
         send_done_tx,
         send_done_rx,
         seed,
@@ -3719,7 +3735,7 @@ impl WalletActor {
 
         // A pipelined send is mid-proof on a blocking thread; its completion is the only thing
         // that stores and broadcasts it.
-        while self.send_in_flight && Instant::now() < deadline {
+        while self.send_queue.proof_in_flight && Instant::now() < deadline {
             match tokio::time::timeout_at(deadline.into(), self.send_done_rx.recv()).await {
                 Ok(Some(done)) => {
                     self.finish_send_caught(done).await;
@@ -3748,7 +3764,8 @@ impl WalletActor {
                 "finished accepted work before shutting down"
             );
         }
-        let abandoned = self.send_queue.len() + usize::from(self.send_in_flight);
+        let abandoned =
+            self.send_queue.pending.len() + usize::from(self.send_queue.proof_in_flight);
         if abandoned > 0 {
             warn!(
                 abandoned,
@@ -5205,8 +5222,14 @@ impl WalletActor {
                 source,
                 reply,
             } => {
-                self.begin_or_queue_send(request, confirmations, privacy, source, reply)
-                    .await;
+                self.send_queue.push(PendingSend {
+                    request,
+                    confirmations,
+                    privacy,
+                    source,
+                    reply,
+                });
+                self.pump_send_queue().await;
             }
             WalletCommand::GetRawTx { txid, reply } => {
                 let res = self.do_get_raw_tx(txid).await;
@@ -6019,7 +6042,7 @@ impl WalletActor {
     /// Build, prove, and broadcast a send inline (today's behaviour): the whole of phase A->C runs
     /// on the actor under `block_in_place`, so the actor (and thus sync) is blocked for the whole
     /// proof. `[spend] pipeline_proving` moves the proof off the actor - see
-    /// [`Self::begin_or_queue_send`]. Used directly when pipelining is disabled or ineligible.
+    /// [`Self::start_send`]. Used directly when pipelining is disabled or ineligible.
     async fn do_send(
         &mut self,
         request: TransactionRequest,
@@ -6299,31 +6322,18 @@ impl WalletActor {
         Ok(txid)
     }
 
-    /// Entry point for a `Send` command. Runs inline (today's behaviour) unless pipelining is
-    /// eligible, in which case the proof runs off the actor so sync stays live. Pipelined sends
-    /// stay serialized: only one PCZT is uncommitted at a time (no double-spend surface, no
-    /// reservation overlay), so a send arriving while a proof is in flight is queued and started
-    /// once the in-flight one commits.
-    async fn begin_or_queue_send(
-        &mut self,
-        request: TransactionRequest,
-        confirmations: Option<ConfirmationsPolicy>,
-        privacy: SendPrivacy,
-        source: SendSource,
-        reply: oneshot::Sender<Result<TxId, RpcError>>,
-    ) {
-        // `AllowFullyTransparent` sends are handled inline by `do_send` (they build via the
-        // transparent Builder, not the cached-Orchard PCZT prove path that pipelining accelerates),
-        // so never queue them for off-actor proving.
-        //
-        // A transparent *source* (`z_sendmany` from a t-address / `ANY_TADDR`) can't ride the
-        // pipeline either: the PCZT prove+sign step has no transparent signing pass, so `do_send`
-        // diverts transparent-funded proposals to the fused path, which signs transparent inputs
-        // itself. Routing here (before the queue) also keeps every queued send shielded-source.
-        //
-        // A Sapling-output send can't ride the pipeline either (it commits via the same PCZT
-        // extractor that has no Sapling verifying key). Route it through `do_send`, which diverts
-        // it to the fused path.
+    /// Choose how to build a send only after earlier sends have recorded their inputs.
+    async fn start_send(&mut self, send: PendingSend) {
+        let PendingSend {
+            request,
+            confirmations,
+            privacy,
+            source,
+            reply,
+        } = send;
+        // Fully transparent payments and transparent sources need the inline builder.
+        // Sapling outputs need its verifying key. Keep the caller's original funding policy
+        // on both paths, including the shielded fallback for a source-less payout.
         if privacy == SendPrivacy::AllowFullyTransparent
             || matches!(source, SendSource::Transparent(_))
             || !self.pipeline_eligible()
@@ -6333,31 +6343,14 @@ impl WalletActor {
             let _ = reply.send(res);
             return;
         }
-        if self.send_in_flight {
-            if self.send_queue.len() >= MAX_QUEUED_SENDS {
-                let _ = reply.send(Err(RpcError::wallet(format!(
-                    "too many sends queued behind an in-flight proof ({MAX_QUEUED_SENDS}); \
-                     retry shortly"
-                ))));
-                return;
-            }
-            self.send_queue.push_back(PendingSend {
-                request,
-                confirmations,
-                privacy,
-                source,
-                reply,
-            });
-            return;
-        }
         self.start_pipelined_send(request, confirmations, privacy, source, reply)
             .await;
     }
 
     /// Start a pipelined send: do phase A on the actor, then hand phase B (prove+sign) to a
     /// blocking thread and return to the loop. On a phase-A failure the caller is replied to here
-    /// and `send_in_flight` is left clear (the queue is pumped by the caller). On success
-    /// `send_in_flight` is set and the completion arrives later via `send_done_tx`.
+    /// and `proof_in_flight` is left clear (the queue is pumped by the caller). On success
+    /// `proof_in_flight` is set and the completion arrives later via `send_done_tx`.
     async fn start_pipelined_send(
         &mut self,
         request: TransactionRequest,
@@ -6373,7 +6366,7 @@ impl WalletActor {
         // rather than zecd's last-scanned height (which lags under load, producing an
         // already-expired -25). Mirrors the call in `do_send` for the non-pipelined path; a
         // no-op when the sync loop already has the wallet caught up. Runs here (not in
-        // `begin_or_queue_send`) so a send queued behind an in-flight proof re-syncs when it
+        // `start_send`) so a send queued behind an in-flight proof re-syncs when it
         // actually starts, keeping its tip fresh.
         if let Err(e) = self.sync_to_tip_for_send().await {
             let _ = reply.send(Err(e));
@@ -6419,7 +6412,7 @@ impl WalletActor {
             }
         };
         // As on the inline path, this awaits the background keygen only on a young daemon's
-        // first send. It happens before `send_in_flight` is set, so a keygen failure leaves the
+        // first send. It happens before `proof_in_flight` is set, so a keygen failure leaves the
         // pipeline free rather than wedged.
         let keys = match self
             .orchard_keys
@@ -6438,12 +6431,11 @@ impl WalletActor {
         // The prove runs off the actor task, so the wallet span does not follow it; carry it
         // into the closure so the panic/failure logs keep their wallet attribution.
         let span = tracing::Span::current();
-        self.send_in_flight = true;
         tokio::task::spawn_blocking(move || {
             let _entered = span.enter();
             let p0 = Instant::now();
             // Isolate a proving panic: a completion MUST always be sent, or the pipeline would
-            // wedge with `send_in_flight` stuck true.
+            // wedge with `proof_in_flight` stuck true.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 prove_sign_pczt(pczt, orchard_circuit, &usk, &prover, &keys)
             }))
@@ -6462,25 +6454,29 @@ impl WalletActor {
             });
             // `usk` is dropped (zeroized) here.
         });
+        self.send_queue.proof_in_flight = true;
     }
 
-    /// Start the next queued send, draining sends whose phase A fails immediately so the queue
-    /// keeps moving. Stops once a send is in flight (its proof started) or the queue is empty.
+    /// Inline sends finish here. A pipelined send resumes the queue when its proof is stored
+    /// or fails, so the next send always selects inputs against the updated wallet.
     async fn pump_send_queue(&mut self) {
-        while !self.send_in_flight {
-            let Some(p) = self.send_queue.pop_front() else {
-                break;
-            };
-            self.start_pipelined_send(p.request, p.confirmations, p.privacy, p.source, p.reply)
-                .await;
+        use futures_util::FutureExt as _;
+        while let Some(send) = self.send_queue.pop_ready() {
+            if std::panic::AssertUnwindSafe(self.start_send(send))
+                .catch_unwind()
+                .await
+                .is_err()
+            {
+                error!("queued send panicked; the actor continues");
+            }
         }
     }
 
     /// Phase C of a pipelined send, on the actor: store the proven tx (marking inputs spent),
-    /// reply to the caller, and broadcast. Clears `send_in_flight` first so a panic mid-commit
+    /// reply to the caller, and broadcast. Clears `proof_in_flight` first so a panic mid-commit
     /// can't wedge the pipeline (the loop pumps the queue afterwards).
     async fn finish_send(&mut self, done: SendCompletion) {
-        self.send_in_flight = false;
+        self.send_queue.proof_in_flight = false;
         let SendCompletion {
             result,
             orchard_circuit,
@@ -6558,7 +6554,7 @@ impl WalletActor {
 
     /// Run [`finish_send`](Self::finish_send) under panic isolation, then pump the send queue.
     /// Mirrors [`handle_command_caught`](Self::handle_command_caught): a panic on the commit path
-    /// must not take the actor (and every wallet write) down. `send_in_flight` is already cleared
+    /// must not take the actor (and every wallet write) down. `proof_in_flight` is already cleared
     /// inside `finish_send`, so the queue can always make progress afterwards.
     async fn finish_send_caught(&mut self, done: SendCompletion) {
         use futures_util::FutureExt as _;
@@ -6571,7 +6567,7 @@ impl WalletActor {
                 "pipelined send commit panicked; the actor continues (this is a bug - \
                  please report it)"
             );
-            self.send_in_flight = false;
+            self.send_queue.proof_in_flight = false;
         }
         self.pump_send_queue().await;
     }
@@ -8257,7 +8253,7 @@ fn now_unix() -> i64 {
 /// with a non-empty Sapling bundle - spends are always Orchard and change goes to Orchard (Sapling
 /// isn't an enabled pool on that path, or `cached_pczt_path` is already false). The PCZT extractor
 /// (`extract_and_store_transaction_from_pczt`) rejects such a bundle without a Sapling *verifying*
-/// key, and the cached path passes none - so `do_send`/`begin_or_queue_send` divert these sends to
+/// key, and the cached path passes none - so `do_send`/`start_send` divert these sends to
 /// the fused `create_proposed_transactions` path, which builds, proves, and verifies Sapling
 /// outputs itself. A dual Orchard+Sapling UA is deliberately *not* flagged: an Orchard-only wallet
 /// routes the payment to the UA's Orchard receiver, so no Sapling output is produced. Keyed off the
@@ -8415,7 +8411,7 @@ fn prove_sign_pczt(
 /// marks inputs spent - the same wallet bookkeeping `create_proposed_transactions` does. A DB
 /// write, so it runs on the single-writer actor. The Sapling verifying key is `None` because this
 /// path is only reached for sends with **no Sapling output** - the extractor rejects a Sapling
-/// bundle without one, so `do_send`/`begin_or_queue_send` divert any send to a Sapling-only
+/// bundle without one, so `do_send`/`start_send` divert any send to a Sapling-only
 /// recipient to the fused path before reaching here (the guard is `request_pays_sapling_output`).
 /// Note this is about Sapling *outputs*, not spends: zecd never spends Sapling notes on this path,
 /// but a send can still *pay* a Sapling recipient. `N` (the note-ref type) is otherwise
@@ -9047,6 +9043,57 @@ fn coinbase_hint(zats: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn overlapping_sends_wait_in_order_with_their_original_policies() {
+        use super::{
+            ConfirmationsPolicy, PendingSend, SendPrivacy, SendQueue, SendSource,
+            TransactionRequest,
+        };
+        use crate::wallet::ShieldedFamily;
+
+        let policies = [
+            (
+                SendSource::Unspecified,
+                SendPrivacy::AllowFullyTransparent,
+                None,
+            ),
+            (
+                SendSource::Transparent(None),
+                SendPrivacy::AllowRevealedSenders,
+                Some(ConfirmationsPolicy::MIN),
+            ),
+            (
+                SendSource::ShieldedFamily(ShieldedFamily::Orchard),
+                SendPrivacy::FullPrivacy,
+                Some(ConfirmationsPolicy::default()),
+            ),
+        ];
+        let mut queue = SendQueue {
+            proof_in_flight: true,
+            ..Default::default()
+        };
+        for (source, privacy, confirmations) in policies {
+            let (reply, _) = tokio::sync::oneshot::channel();
+            queue.push(PendingSend {
+                request: TransactionRequest::empty(),
+                confirmations,
+                privacy,
+                source,
+                reply,
+            });
+            assert!(
+                queue.pop_ready().is_none(),
+                "a pending proof holds the inputs"
+            );
+        }
+        queue.proof_in_flight = false;
+        for expected in policies {
+            let send = queue.pop_ready().expect("queued send");
+            assert_eq!((send.source, send.privacy, send.confirmations), expected);
+        }
+        assert!(queue.pop_ready().is_none());
+    }
+
     #[test]
     fn orchard_bundles_prove_under_the_circuit_their_branch_names() {
         use super::orchard_circuit_for_branch;

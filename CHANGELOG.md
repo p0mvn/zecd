@@ -31,7 +31,8 @@ project adheres to [Semantic Versioning](https://semver.org).
   transparent funds first; when they fall short it is now paid from shielded notes, with
   shielded change, instead of failing with `-6` while `listunspent` reports enough funds.
   A `sendmany` shortfall includes the lowercase `insufficient funds` message s-nomp checks
-  before retrying a payout with a fee allowance.
+  before retrying a payout with a fee allowance. When proving is pipelined, overlapping payouts
+  wait for the earlier spend to be recorded before selecting funds with their own privacy policy.
 - `listunspent` also excludes shielded rewards disconnected before a wallet upgrade when
   the wallet retained the raw coinbase transaction.
 - **Forwarded `getmininginfo` includes `difficulty`.** The node's answer is returned as before,

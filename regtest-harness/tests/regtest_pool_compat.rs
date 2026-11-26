@@ -661,20 +661,75 @@ async fn regtest_pool_rpc_contracts() {
     //    succeed from either: from the refilled t-address while it covers the payout, and from
     //    shielded notes once it does not, rather than failing with -6.
     cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
+    cfg.pipeline_proving = Some(true);
     zecd.restart(&cfg)
         .await
         .expect("restart zecd with the transparent policy");
     zecd.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
         .await
         .expect("zecd sync");
+    // The first payout spends shielded notes. Submit the transparent payout while the first
+    // operation is active: both have their own funds, but the wallet must commit them in order.
+    mine(&zebrad, &zecd, 3).await;
+    let full_balance = zecd
+        .call("z_getbalance", json!([pool_ua, 1]))
+        .await
+        .unwrap();
+    let op = zecd.call("z_sendmany", json!([
+        pool_ua, [{"address": workers[5], "amount": PAYOUT_ZEC}], 1, null, "AllowRevealedRecipients"
+    ])).await.expect("start shielded payout");
+    let opid = op.as_str().unwrap();
+    let deadline = Instant::now() + OP_TIMEOUT;
+    loop {
+        let status = zecd
+            .call("z_getoperationstatus", json!([[opid]]))
+            .await
+            .unwrap();
+        match status[0]["status"].as_str() {
+            Some("executing" | "success") => break,
+            Some("queued") if Instant::now() < deadline => tokio::task::yield_now().await,
+            _ => panic!("shielded payout did not start: {status}"),
+        }
+    }
     let small: serde_json::Map<String, Value> = [(workers[3].clone(), json!(PAYOUT_ZEC))]
         .into_iter()
         .collect();
-    let from_t = zecd
-        .call("sendmany", json!(["", small]))
-        .await
-        .expect("sendmany covered by transparent funds");
+    // One request fits in the transparent refill. The other must try the shielded fallback,
+    // where even the pre-payout balance leaves nothing for the fee.
+    let (from_t, shortfall) = tokio::join!(
+        zecd.call("sendmany", json!(["", small])),
+        zecd.call(
+            "sendmany",
+            json!(["", { (workers[4].as_str()): full_balance }])
+        ),
+    );
+    let from_t = from_t.expect("sendmany covered by transparent funds");
+    let shortfall = shortfall.expect_err("the full balance cannot cover both payout and fee");
+    assert_eq!(shortfall.code(), Some(-6), "{shortfall}");
+    assert!(
+        shortfall.to_string().contains("insufficient funds"),
+        "{shortfall}"
+    );
+    let mempool = zebrad.rpc("getrawmempool", json!([])).await.unwrap();
+    let first_txid = operation_txid(&zecd, opid).await;
+    assert!(
+        mempool
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|txid| txid == &first_txid),
+        "the earlier shielded payout must be broadcast before the queued payouts finish"
+    );
     mine(&zebrad, &zecd, 1).await;
+    let first = zebrad
+        .rpc("getrawtransaction", json!([first_txid, 1]))
+        .await
+        .unwrap();
+    assert_eq!(
+        first["vin"].as_array().map(Vec::len),
+        Some(0),
+        "the named shielded source must stay shielded: {first}"
+    );
     let raw = zebrad
         .rpc("getrawtransaction", json!([from_t, 1]))
         .await
@@ -712,18 +767,6 @@ async fn regtest_pool_rpc_contracts() {
         shielded > large + 0.01,
         "the shielded notes cover a payout the t-address cannot: {shielded} vs {large}"
     );
-    // A payout for the full shielded balance leaves nothing for its fee. The transparent
-    // funds are smaller still. s-nomp retries only this exact code and case-sensitive text.
-    let shortfall = zecd
-        .call("sendmany", json!(["", { (workers[4].as_str()): shielded }]))
-        .await
-        .expect_err("the full balance cannot cover both payout and fee");
-    assert_eq!(shortfall.code(), Some(-6), "{shortfall}");
-    assert!(
-        shortfall.to_string().contains("insufficient funds"),
-        "{shortfall}"
-    );
-
     let large_amounts: serde_json::Map<String, Value> =
         [(workers[4].clone(), json!(large))].into_iter().collect();
     let from_z = zecd
