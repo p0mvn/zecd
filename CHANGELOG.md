@@ -22,10 +22,10 @@ project adheres to [Semantic Versioning](https://semver.org).
   history after a chain reorganization. See the client-specific limits in the operations guide.
 
 ### Changed
-- **`gettransaction`, `listtransactions` and `listsinceblock` label a coinbase receive the way
-  Bitcoin Core does**: `immature` until it can be spent (100 confirmations), then `generate`,
-  and `orphan` once its block has left the chain, with `generated: true` on every coinbase
-  entry. They used to say `receive`, which pool software reads as an orphaned block.
+- **`gettransaction`, `listtransactions` and `listsinceblock` identify mined rewards.**
+  Transparent rewards report `immature` until the wallet scans 100 confirmations, then
+  `generate`. Shielded rewards report `generate` immediately. Both report `orphan` after
+  disconnection and carry `generated: true`. They previously reported `receive`.
 - **An explicit fee on `z_sendmany`, `z_shieldcoinbase` and `z_mergetoaddress` is accepted
   instead of refused with `-8`.** The ZIP 317 fee is still what is paid, and the requested fee
   is logged. A negative or non-numeric fee is refused (`-3`). `sendtoaddress`, `sendmany` and

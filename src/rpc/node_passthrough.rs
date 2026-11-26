@@ -91,6 +91,10 @@ mod tests {
                 "submitblock" if req["params"].as_array().is_none_or(|p| p.is_empty()) => {
                     err(-32602, "Invalid params: expected a block")
                 }
+                "submitblock" if req["params"][0] == "beef" => ok(Value::Null),
+                "submitblock" if req["params"][0] == "abcd" => {
+                    Json(json!({"id": req["id"], "error": null}))
+                }
                 "submitblock" => ok(json!("duplicate")),
                 other => err(-32601, &format!("Method not found: {other}")),
             }
@@ -137,6 +141,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, json!("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn submitblock_requires_an_explicit_result_even_when_null() {
+        let hub = hub_at(fake_node().await);
+        let accepted = forward_via(Some(&hub), &call("submitblock", vec![json!("beef")]), None)
+            .await
+            .unwrap();
+        assert!(accepted.is_null());
+        let missing = forward_via(Some(&hub), &call("submitblock", vec![json!("abcd")]), None)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code, -1);
+        assert_eq!(missing.message, "submitblock: the node did not answer");
     }
 
     #[tokio::test]

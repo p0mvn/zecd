@@ -489,7 +489,9 @@ impl ZebraClient {
                 "zebra rpc returned HTTP {status}"
             )));
         }
-        Ok(envelope.get("result").cloned().unwrap_or(Value::Null))
+        envelope.get("result").cloned().ok_or_else(|| {
+            CallError::Transport(anyhow!("zebra rpc response is missing its result"))
+        })
     }
 
     /// [`Self::call`] for a caller forwarding a request it did not build itself: the node's

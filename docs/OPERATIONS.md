@@ -288,8 +288,12 @@ mature rewards and pays recipients. Two client behaviors affect deployment:
 
 | Client revision | Behavior and operator action |
 | --- | --- |
-| [s-nomp e6498056](https://github.com/s-nomp/s-nomp/tree/e6498056547d77d684097fe3024eb47110177e30) | Its transparent-wallet refill subtracts only 0.0001 ZEC from the shielded balance. If ZIP 317 requires more, the operation ends with insufficient funds (`-6`) and sends nothing. Change the refill amount to leave enough for the transaction fee before enabling automatic refills. |
-| [Miningcore a553f623](https://github.com/oliverw/miningcore/tree/a553f62301f44c6df80891e408b6526d1dd98692) | A 50-recipient payout can succeed when the balance covers all outputs and the ZIP 317 fee. A near-balance payout reserving only 0.0001 ZEC can fail with `-6`. Its stock Zcash block builder also writes zero coinbase expiry height. On mainnet from NU5 onward the expiry height must equal the block height. Use a builder that satisfies the active consensus rules before mining. |
+| [s-nomp e6498056](https://github.com/s-nomp/s-nomp/tree/e6498056547d77d684097fe3024eb47110177e30) | Its transparent-wallet refill subtracts only 0.0001 ZEC from the shielded balance. If ZIP 317 requires more, the operation ends with insufficient funds (`-6`) and sends nothing. Change the refill amount to leave enough for the transaction fee before enabling automatic refills. Its payment processor replaces an `orphan` category with `immature` when confirmations are below its threshold. Preserve `orphan` before applying the depth check so disconnected rounds can be retired. [Payment processor](https://github.com/s-nomp/s-nomp/blob/e6498056547d77d684097fe3024eb47110177e30/libs/paymentProcessor.js#L795-L809) |
+| [Miningcore a553f623](https://github.com/oliverw/miningcore/tree/a553f62301f44c6df80891e408b6526d1dd98692) | A 50-recipient payout can succeed when the balance covers all outputs and the ZIP 317 fee. A near-balance payout reserving only 0.0001 ZEC can fail with `-6`. |
+
+Both stock block builders leave the coinbase expiry height at zero. On mainnet from NU5
+onward, consensus requires the expiry height to equal the height of the block being mined.
+Use a compatible block builder with either client before mining. [ZIP 203](https://zips.z.cash/zip-0203)
 
 For either client, poll the operation to completion and record the returned transaction ID
 before marking a payout as sent. The regtest covers node-built blocks and wallet payments.
@@ -314,9 +318,10 @@ before marking a payout as sent. The regtest covers node-built blocks and wallet
 - Miningcore: `address` is the coinbase address and `z-address` the unified address.
 
 **What zecd does with the pool calls.**
-- `gettransaction` on a coinbase reads `immature` until the output can be spent (100
-  confirmations), then `generate`; `orphan` once the block has left the chain. Every coinbase
-  entry carries `generated: true`.
+- `gettransaction` and wallet history report a mined transparent reward as `immature` until
+  the wallet has scanned 100 confirmations, then as `generate`. A mined shielded reward
+  reports `generate` immediately. Either kind reports `orphan` when its block leaves the
+  chain. Coinbase transactions carry `generated: true`.
 - `z_getbalance <address> [minconf]`: for a transparent address, its unspent outputs at that
   depth (immature coinbase is never counted); for one of the wallet's unified or Sapling
   addresses, the wallet's spendable balance in the pools that address can receive into (Orchard

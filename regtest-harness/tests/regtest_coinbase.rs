@@ -754,6 +754,35 @@ async fn regtest_shielded_coinbase_receive_and_spend() {
             zecd_regtest_harness::NU6_3_ACTIVATION_HEIGHT
         );
     }
+    let reward = &entries[0];
+    assert!(reward["confirmations"].as_u64().unwrap() < 100);
+    let tx = zecd
+        .call("gettransaction", json!([reward["txid"]]))
+        .await
+        .unwrap();
+    assert_eq!(tx["generated"], true);
+    assert!(
+        tx["details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["category"] == "generate"),
+        "{tx}"
+    );
+    let history = zecd
+        .call("listtransactions", json!(["*", 100]))
+        .await
+        .unwrap();
+    assert!(
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["txid"] == reward["txid"]
+                && e["category"] == "generate"
+                && e["generated"] == true),
+        "{history}"
+    );
     let coinbase_total: f64 = entries
         .iter()
         .map(|e| e["amount"].as_f64().expect("amount"))

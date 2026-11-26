@@ -542,7 +542,12 @@ mod tests {
                         "submitblock" => {
                             let raw = request["params"][0].as_str().unwrap();
                             assert_eq!(raw.len(), 4_000_000);
-                            assert!(raw.as_bytes().chunks_exact(2).all(|pair| pair == b"ab"));
+                            assert!(raw
+                                .as_bytes()
+                                .as_chunks::<2>()
+                                .0
+                                .iter()
+                                .all(|pair| pair == b"ab"));
                             Value::Null
                         }
                         "getblock" => request["params"].clone(),

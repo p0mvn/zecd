@@ -756,6 +756,12 @@ pub(crate) fn z_getbalance(
     Ok(zats_to_value(zats))
 }
 
+/// Apply both the requested depth and transparent coinbase maturity at the wallet's scan height.
+fn meets_unspent_depth(note: &read::UnspentNote, confirmations: i64, minconf: i64) -> bool {
+    confirmations >= minconf
+        && (!note.generated || confirmations >= i64::from(read::COINBASE_MATURITY))
+}
+
 /// The unspent transparent value at `addr` with at least `minconf` confirmations.
 fn transparent_balance_at(
     notes: &[read::UnspentNote],
@@ -766,7 +772,7 @@ fn transparent_balance_at(
     notes
         .iter()
         .filter(|n| n.pool == 0 && n.address.as_deref() == Some(addr))
-        .filter(|n| st.confirmations(n.mined_height) >= minconf)
+        .filter(|n| meets_unspent_depth(n, st.confirmations(n.mined_height), minconf))
         .map(|n| n.value)
         .sum()
 }
@@ -1239,17 +1245,12 @@ fn output_categories(from_account: bool, to_account: bool) -> &'static [&'static
     }
 }
 
-/// Bitcoin Core's category for an output a coinbase transaction paid the wallet, which mining
-/// pools read to decide whether a block they found still counts: `immature` until the output
-/// can be spent ([`read::COINBASE_MATURITY`] confirmations, the same depth `listunspent` and the
-/// balances use), `generate` after, and `orphan` once the block has left the chain. A coinbase
-/// is never in the mempool, so an unmined one has been reorged out. Zero confirmations on a
-/// mined coinbase only means the scan has not reached its block yet, so it reads `immature`,
-/// not `orphan`.
-fn coinbase_category(confirmations: i64, mined: bool) -> &'static str {
+/// A detached block reward is orphaned in every pool. Only transparent rewards have
+/// a 100-confirmation maturity period. ZIP 213 shielded rewards are ordinary notes.
+fn coinbase_category(pool: i64, confirmations: i64, mined: bool) -> &'static str {
     if confirmations < 0 || !mined {
         "orphan"
-    } else if confirmations < i64::from(read::COINBASE_MATURITY) {
+    } else if pool == 0 && confirmations < i64::from(read::COINBASE_MATURITY) {
         "immature"
     } else {
         "generate"
@@ -1270,7 +1271,7 @@ fn tx_output_categories(
     categories
         .iter()
         .map(|c| match *c {
-            "receive" => coinbase_category(confirmations, tx.mined_height.is_some()),
+            "receive" => coinbase_category(out.pool, confirmations, tx.mined_height.is_some()),
             other => other,
         })
         .collect()
@@ -2389,7 +2390,7 @@ fn unspent_json(
             // safe to spend; a foreign note surfaced at 0-conf (minconf=0, fed by the
             // mempool stream) is not.
             let safe = *conf > 0 || n.trusted;
-            *conf >= minconf
+            meets_unspent_depth(n, *conf, minconf)
                 && *conf <= maxconf
                 && (include_unsafe || safe)
                 && filter.is_none_or(|f| n.address.as_ref().is_some_and(|a| f.contains(a)))
@@ -2796,7 +2797,8 @@ fn parse_opid_filter(req: &RpcRequest, i: usize) -> Result<Option<Vec<OperationI
 /// `ANY_TADDR` spends the wallet's transparent UTXOs - requiring privacyPolicy
 /// `AllowRevealedSenders` or weaker - which with a shielded recipient is the t->z *shielding*
 /// send (change shields). `ANY_SPROUT` is rejected as unsupported rather than as an unparseable
-/// address. Fees are ZIP-317 (an explicit `fee` is `-8`); `minconf` overrides input-selection
+/// address. A non-negative numeric `fee` is accepted and the wallet pays the ZIP 317 fee.
+/// `minconf` overrides input-selection
 /// depth for this send.
 pub(crate) fn z_sendmany(
     state: &AppState,
@@ -5549,18 +5551,19 @@ mod tests {
         assert!(z_tx_entries(&NET, &c, 1, 0).is_empty());
     }
 
-    /// A coinbase reads `immature` until it can be spent, `generate` after, and `orphan` once
-    /// its block has left the chain. A mined coinbase the scan has not reached yet (zero
-    /// confirmations) is still immature, never orphaned.
     #[test]
     fn coinbase_category_follows_maturity() {
-        assert_eq!(coinbase_category(-1, true), "orphan");
-        assert_eq!(coinbase_category(5, false), "orphan");
-        assert_eq!(coinbase_category(0, true), "immature");
-        assert_eq!(coinbase_category(1, true), "immature");
-        assert_eq!(coinbase_category(99, true), "immature");
-        assert_eq!(coinbase_category(100, true), "generate");
-        assert_eq!(coinbase_category(5000, true), "generate");
+        for pool in [0, 2, 3, 4] {
+            assert_eq!(coinbase_category(pool, -1, true), "orphan");
+            assert_eq!(coinbase_category(pool, 5, false), "orphan");
+            assert_eq!(coinbase_category(pool, 100, true), "generate");
+        }
+        for conf in [0, 1, 99] {
+            assert_eq!(coinbase_category(0, conf, true), "immature");
+            for pool in [2, 3, 4] {
+                assert_eq!(coinbase_category(pool, conf, true), "generate");
+            }
+        }
     }
 
     /// The coinbase category reaches both `gettransaction.details` and the history entries, and
@@ -5573,11 +5576,18 @@ mod tests {
                 Some(100),
                 false,
                 None,
-                vec![out(false, true, 625_000_000, Some("t"), false)],
+                vec![
+                    TxOutputRecord {
+                        pool: 0,
+                        ..out(false, true, 625_000_000, Some("t"), false)
+                    },
+                    out(false, true, 500, Some("ua"), false),
+                ],
             )
         };
         let d = gettransaction_details(&NET, &coinbase, 3);
         assert_eq!(d[0]["category"], "immature");
+        assert_eq!(d[1]["category"], "generate");
         let d = gettransaction_details(&NET, &coinbase, 100);
         assert_eq!(d[0]["category"], "generate");
         let e = tx_entries(&NET, &coinbase, 100, 0, None);
@@ -5629,6 +5639,22 @@ mod tests {
         assert_eq!(transparent_balance_at(&notes, &st, "t1a", 8), 10);
         assert_eq!(transparent_balance_at(&notes, &st, "t1a", 0), 70);
         assert_eq!(transparent_balance_at(&notes, &st, "t1c", 0), 0);
+    }
+
+    #[test]
+    fn transparent_coinbase_matures_at_the_reported_scan_height() {
+        let st = status(100); // Known chain tip is 105.
+        let reward = |height| read::UnspentNote {
+            pool: 0,
+            generated: true,
+            address: Some("t1a".into()),
+            ..note(Some(height), 100, false, None)
+        };
+        let notes = [reward(1), reward(2)];
+        assert_eq!(transparent_balance_at(&notes, &st, "t1a", 0), 100);
+        let rows = unspent_json(&notes, &st, 0, 999, None, true);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["confirmations"], 100);
     }
 
     /// `z_getbalance` on a shielded address counts the pools its receivers can hold: Sapling for

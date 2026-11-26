@@ -2223,6 +2223,57 @@ fn a_rescan_written_address_row_still_answers_for_the_address_the_wallet_issued(
     );
 }
 
+#[test]
+fn list_unspent_excludes_only_the_detached_coinbase_at_zero_expiry() {
+    let net = network::regtest();
+    let dir = tempfile::tempdir().unwrap();
+    let mut db = open::init_dbs(net, dir.path()).unwrap();
+    db.create_account("primary", &test_seed(), &genesis_birthday(), None)
+        .unwrap();
+    db.update_chain_tip(BlockHeight::from_u32(200)).unwrap();
+    drop(db);
+
+    let conn = rusqlite::Connection::open(open::data_db_path(dir.path())).unwrap();
+    // Two legacy transactions with no expiry and no mined position. Only the reward
+    // has a null prevout. An ordinary pending receive must remain visible at minconf 0.
+    for (id, prev_hash) in [(1, [0u8; 32]), (2, [1u8; 32])] {
+        let mut raw = vec![1, 0, 0, 0, 1]; // v1, one transparent input
+        raw.extend(prev_hash);
+        raw.extend([0xff; 4]); // prevout index
+        raw.extend([2, 1, 1]); // height in the coinbase script
+        raw.extend([0xff; 4]); // sequence
+        raw.push(1); // one transparent output
+        raw.extend(100u64.to_le_bytes());
+        raw.extend([0; 5]); // empty output script, locktime zero
+        let tx = zcash_primitives::transaction::Transaction::read(
+            raw.as_slice(),
+            zcash_protocol::consensus::BranchId::Sprout,
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO transactions (id_tx, txid, raw, expiry_height, min_observed_height)
+                      VALUES (?1, ?2, ?3, 0, 1)",
+            rusqlite::params![id, tx.txid().as_ref().as_slice(), raw],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO transparent_received_outputs
+                     (transaction_id, output_index, account_id, address, script, value_zat, address_id)
+                     SELECT ?1, 0, account_id, 'tmtest', X'00', 100, id FROM addresses LIMIT 1", [id]).unwrap();
+    }
+    let notes = read::list_unspent(net, dir.path(), read::AccountScope::Any).unwrap();
+    assert_eq!(notes.len(), 1);
+    let ordinary: Vec<u8> = conn
+        .query_row("SELECT txid FROM transactions WHERE id_tx = 2", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        notes[0].txid,
+        hex::encode(ordinary.into_iter().rev().collect::<Vec<_>>())
+    );
+    assert_eq!(notes[0].mined_height, None);
+}
+
 fn populate_two_transactions(conn: &rusqlite::Connection, account_id: i64, address_id: i64) {
     for (id_tx, tag) in [(1i64, 0xa1u8), (2, 0xb2)] {
         conn.execute(

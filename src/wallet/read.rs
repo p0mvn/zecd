@@ -831,20 +831,7 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
             block_time: row.get("block_time")?,
             expired_unmined: row.get("expired_unmined")?,
             tx_index: row.get("tx_index")?,
-            detached_coinbase: match row.get_ref("unmined_raw")? {
-                rusqlite::types::ValueRef::Blob(bytes) => {
-                    // The branch argument supplies pre-v5 signature context and has no
-                    // effect on decoding a transparent input. Later formats encode their branch.
-                    zcash_primitives::transaction::Transaction::read(
-                        bytes,
-                        zcash_protocol::consensus::BranchId::Sapling,
-                    )
-                    .ok()
-                    .and_then(|tx| tx.transparent_bundle().map(|bundle| bundle.is_coinbase()))
-                    .unwrap_or(false)
-                }
-                _ => false,
-            },
+            detached_coinbase: raw_is_coinbase(row.get_ref("unmined_raw")?),
             block_hash: row
                 .get::<_, Option<Vec<u8>>>("block_hash")?
                 .map(|h| txid_display(&h)),
@@ -853,6 +840,24 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
             raw: None,
         },
     ))
+}
+
+/// After a rewind clears the block index, the null transparent prevout identifies a coinbase.
+fn raw_is_coinbase(raw: rusqlite::types::ValueRef<'_>) -> bool {
+    match raw {
+        rusqlite::types::ValueRef::Blob(bytes) => {
+            // The branch argument supplies pre-v5 signature context and has no
+            // effect on decoding a transparent input. Later formats encode their branch.
+            zcash_primitives::transaction::Transaction::read(
+                bytes,
+                zcash_protocol::consensus::BranchId::Sapling,
+            )
+            .ok()
+            .and_then(|tx| tx.transparent_bundle().map(|bundle| bundle.is_coinbase()))
+            .unwrap_or(false)
+        }
+        _ => false,
+    }
 }
 
 /// One transaction's row, built from base tables instead of `v_transactions`.
@@ -1752,7 +1757,8 @@ pub fn list_unspent(
         // with `generated = true`.
         let sql = format!(
             "SELECT t.txid, txo.output_index, txo.value_zat, txo.address,
-                    (IFNULL(t.tx_index, 1) == 0) AS generated
+                    (IFNULL(t.tx_index, 1) == 0) AS generated,
+                    CASE WHEN t.mined_height IS NULL AND t.tx_index IS NULL THEN t.raw END AS unmined_raw
              FROM transparent_received_outputs txo
              JOIN transactions t ON t.id_tx = txo.transaction_id
              WHERE (t.mined_height IS NOT NULL OR ({unexpired_t}))
@@ -1768,17 +1774,17 @@ pub fn list_unspent(
                )"
         );
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(named_params! { ":target_height": target }, |r| {
-            Ok((
-                r.get::<_, Vec<u8>>(0)?,
-                r.get::<_, u32>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, bool>(4)?,
-            ))
-        })?;
-        for row in rows {
-            let (txid, vout, value, address, generated) = row?;
+        let mut rows = stmt.query(named_params! { ":target_height": target })?;
+        while let Some(row) = rows.next()? {
+            // A zero-expiry detached reward passes the expiry predicate but can never be spent.
+            if raw_is_coinbase(row.get_ref("unmined_raw")?) {
+                continue;
+            }
+            let txid: Vec<u8> = row.get(0)?;
+            let vout = row.get(1)?;
+            let value: i64 = row.get(2)?;
+            let address = row.get(3)?;
+            let generated = row.get(4)?;
             let txid = txid_display(&txid);
             let (mined_height, trusted) = tx_meta.get(&txid).copied().unwrap_or((None, false));
             out.push(UnspentNote {
