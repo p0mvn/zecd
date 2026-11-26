@@ -472,9 +472,7 @@ def main() -> int:
        "address" not in bad and "scriptPubKey" not in bad and "isscript" not in bad)
     ck("invalid validateaddress has error fields",
        "error" in bad and "error_locations" in bad)
-    # z_validateaddress: zcashd's shielded-address validator. zecd's accepts every address kind
-    # rather than reporting a t-address invalid, and reports ownership - which is the reason it
-    # exists alongside validateaddress, whose contract carries no ismine.
+    # z_validateaddress uses zcashd's address-kind and receiver names and requires a wallet.
     zva = rpc.call("z_validateaddress", addr)
     ck("z_validateaddress.isvalid", zva["isvalid"] is True)
     ck("z_validateaddress echoes address", zva.get("address") == addr)

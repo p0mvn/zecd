@@ -1070,11 +1070,6 @@ pub(crate) fn getaddressinfo(
 /// divergence, so this accepts all of them and names which in `address_type`. Callers that need
 /// zcashd's narrower behaviour can branch on that field.
 ///
-/// The reason this exists separately from `validateaddress` is `ismine`: zcashd-lineage tooling
-/// uses `z_validateaddress` to decide whether an address is the wallet's own before a self-send
-/// or a consolidation. `validateaddress` deliberately carries no ownership signal (validity and
-/// ownership are split between it and `getaddressinfo`), so a port has nowhere to ask.
-///
 /// The wallet is resolved strictly, unlike `validateaddress`'s best-effort lookup: an `ismine`
 /// of `false` must mean "not this wallet's", never "there was no wallet to ask".
 pub(crate) fn z_validateaddress(
