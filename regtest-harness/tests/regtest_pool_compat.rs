@@ -373,7 +373,11 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
         Some(0),
         "a coinbase shielding has no transparent outputs: {raw}"
     );
-    mine(&zebrad, &zecd, PAYOUT_MINCONF).await;
+    // zecd's `minconf` N treats a shielded note as spendable one block later than zcashd does:
+    // `listunspent` reports N confirmations after N blocks, but `getbalance`, `z_getbalance`
+    // and `z_sendmany` at minconf N only count it after N + 1. The balance and the send agree,
+    // which is what Miningcore relies on, so mine the extra block rather than test the offset.
+    mine(&zebrad, &zecd, PAYOUT_MINCONF + 1).await;
 
     // 5. The shielded balance, at Miningcore's minconf, is exactly the shielded notes, which
     //    are Ironwood notes on this NU6.3-active chain.
