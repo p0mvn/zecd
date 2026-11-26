@@ -5,6 +5,32 @@ All notable changes to zecd are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com), and this
 project adheres to [Semantic Versioning](https://semver.org).
 
+## [Unreleased]
+
+### Added
+- **Mining pools can use zecd as their only daemon.** On a zebra backend, `getblocktemplate`,
+  `submitblock`, `getblock`, `getblocksubsidy`, `getmininginfo`, `getdifficulty`,
+  `getnetworkhashps` and `getnetworksolps` are forwarded to the node unchanged. A node refusal
+  keeps the node's own code and message; an unreachable node is a generic `-1` with the details
+  in the log only; a lightwalletd backend answers `-32601`. `[rpc] allowed_methods` can leave
+  them out. `docs/OPERATIONS.md` has a "Mining pools" section for s-nomp and Miningcore.
+- **`z_getbalance <address> [minconf]`**, zcashd's per-address balance. A transparent address
+  reports its unspent outputs at that depth; one of the wallet's unified or Sapling addresses
+  reports the wallet's spendable balance in the pools that address can receive into (Orchard
+  and Ironwood for an Orchard receiver).
+- **A regtest test of the exact calls s-nomp and Miningcore send** (`regtest_pool_compat`),
+  from block templates through a 50-recipient payout.
+
+### Changed
+- **`gettransaction`, `listtransactions` and `listsinceblock` label a coinbase receive the way
+  Bitcoin Core does**: `immature` until it can be spent (100 confirmations), then `generate`,
+  and `orphan` once its block has left the chain, with `generated: true` on every coinbase
+  entry. They used to say `receive`, which pool software reads as an orphaned block.
+- **An explicit fee on `z_sendmany`, `z_shieldcoinbase` and `z_mergetoaddress` is accepted
+  instead of refused with `-8`.** The ZIP 317 fee is still what is paid, and the requested fee
+  is logged. A negative or non-numeric fee is refused (`-3`). `sendtoaddress`, `sendmany` and
+  `settxfee` keep refusing fee instructions.
+
 ## [0.10.0] - 2026-11-24
 
 The 0.10.0 line, released as `0.10.0-rc1`. Everything below is relative to 0.9.0; the

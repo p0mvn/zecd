@@ -38,6 +38,15 @@ Know the assumptions so you can see when you are widening the trust boundary.
   `zecd init --encrypt` (Bitcoin-Core-style passphrase, unlocked per session with an enforced
   timeout) whenever unattended spend authority is not actually required.
 
+**Node calls through zecd.** On a zebra backend, zecd forwards `getblocktemplate`,
+`submitblock`, `getblock`, `getblocksubsidy`, `getmininginfo`, `getdifficulty`,
+`getnetworkhashps` and `getnetworksolps` to the node unchanged, under zecd's own `[zebra]`
+credentials, so mining pools can use zecd as their only daemon. Any RPC caller can therefore ask
+the node for block templates and relay blocks to it. If that is more than a deployment needs,
+leave those methods out of `[rpc] allowed_methods`. Node errors come back with the node's own
+code and message; a node that cannot be reached is a generic `-1`, with the details (which name
+the node's address) in zecd's log only. A lightwalletd backend answers `-32601`.
+
 See the README **Security** section for the underlying rationale (RPC credentials as spend
 authority, custody models, the cleartext gate).
 
@@ -270,6 +279,46 @@ work-queue 503s; daemon restarts.
 - An expired unmined tx reports `confirmations: -1` (`abandoned: true`) - treat it as
   failed and safe to re-send.
 - Rapid back-to-back sends can exhaust spendable notes (`-6`) until change confirms.
+
+## Mining pools
+
+Stock s-nomp and Miningcore can use zecd as their only daemon, for mining and payouts alike.
+The pool's coinbase lands on a transparent address of zecd's wallet, is shielded into a unified
+address (Ironwood once NU6.3 is active), and is paid out from there.
+
+**Requirements.**
+- A zebra backend (`server = "zebra"`): the mining calls are forwarded to that node, and a
+  lightwalletd backend has none to forward to.
+- Transparent receiving on the wallet: `[pools] transparent = true`.
+- A privacy policy that lets the pool shield coinbase (a revealed sender) and pay miners at
+  transparent addresses (revealed recipients). Pools do not pass a per-call policy, so set it in
+  config: `[spend] privacy_policy = "AllowFullyTransparent"`, which is what the regtest test of
+  these call shapes (`regtest_pool_compat`) runs with.
+
+**Addresses.**
+- The coinbase address: `getnewaddress "" "transparent"`. Set it as the node's
+  `[mining] miner_address`.
+- The shielded payout address: `z_getaddressforaccount 0 ["orchard"]` (its `address` field).
+  zecd has one account per wallet, so account 0 is the wallet's.
+- s-nomp: `address` is the coinbase address, `zAddress` the unified address, and `tAddress` a
+  second `getnewaddress "" "transparent"` address that s-nomp refills from `zAddress` and pays
+  miners from.
+- Miningcore: `address` is the coinbase address and `z-address` the unified address.
+
+**What zecd does with the pool calls.**
+- `gettransaction` on a coinbase reads `immature` until the output can be spent (100
+  confirmations), then `generate`; `orphan` once the block has left the chain. Every coinbase
+  entry carries `generated: true`.
+- `z_getbalance <address> [minconf]`: for a transparent address, its unspent outputs at that
+  depth (immature coinbase is never counted); for one of the wallet's unified or Sapling
+  addresses, the wallet's spendable balance in the pools that address can receive into (Orchard
+  and Ironwood for an Orchard receiver, Sapling for a Sapling one).
+- An explicit fee on `z_sendmany`, `z_shieldcoinbase` or `z_mergetoaddress` (Miningcore always
+  passes 0.0001) is accepted and logged, and the ZIP 317 fee is what is paid. A 50-recipient
+  payout costs more than 0.0001 ZEC under ZIP 317. A negative or non-numeric fee is still
+  refused.
+- `getblocktemplate` has the node's 30 second call limit, so long polling is not supported.
+- `getaccount` is not implemented; s-nomp carries on when it fails.
 
 ## Reading history: transactions someone else helped fund
 
