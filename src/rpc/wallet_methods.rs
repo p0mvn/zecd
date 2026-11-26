@@ -3114,35 +3114,13 @@ pub(crate) async fn z_shieldcoinbase(
         Some(_) => return Err(RpcError::type_error("memo must be a hex string")),
     };
 
-    // privacyPolicy (arg 5): accepted for zcashd compatibility. Shielding coinbase necessarily
-    // reveals the source addresses and amounts (the transparent inputs are public), so policies
-    // that forbid revealing senders are rejected up front; everything looser is a no-op here.
-    if let Some(v) = req.param(5) {
-        if !matches!(v, Value::Null) {
-            let name = v
-                .as_str()
-                .ok_or_else(|| RpcError::invalid_parameter("privacyPolicy must be a string"))?;
-            match name {
-                "AllowRevealedSenders"
-                | "AllowLinkingAccountAddresses"
-                | "AllowRevealedRecipients"
-                | "AllowFullyTransparent"
-                | "NoPrivacy" => {}
-                "FullPrivacy" | "AllowRevealedAmounts" | "LegacyCompat" => {
-                    return Err(RpcError::invalid_parameter(format!(
-                        "The specified privacy policy, {name}, does not permit shielding \
-                         coinbase funds (which reveals the source addresses). Use \
-                         \"AllowRevealedSenders\" or a weaker policy."
-                    )));
-                }
-                other => {
-                    return Err(RpcError::invalid_parameter(format!(
-                        "Unknown privacy policy: {other}"
-                    )));
-                }
-            }
-        }
-    }
+    // privacyPolicy (arg 5): see `shield_coinbase_privacy`. Omitted means zcashd's
+    // AllowRevealedSenders, never the `[spend]` default.
+    let privacy = shield_coinbase_privacy(req.param(5))?;
+    tracing::debug!(
+        privacy = privacy.policy_name(),
+        "z_shieldcoinbase privacy policy"
+    );
 
     // The synchronous half: build the proposal on the actor (fast - SQL + fee math; no
     // proving). A locked wallet, an unknown source address, or "no coinbase funds" all fail
@@ -3181,6 +3159,37 @@ pub(crate) async fn z_shieldcoinbase(
         "shieldingValue": zats_to_value(shielding_value),
         "opid": opid,
     }))
+}
+
+/// `z_shieldcoinbase`'s privacyPolicy argument. Shielding coinbase necessarily reveals the
+/// source addresses and amounts (the transparent inputs are public), so, like zcashd, an omitted
+/// or null policy is `AllowRevealedSenders` - not the `[spend] privacy_policy` default, which
+/// would otherwise force a pool to weaken privacy for every other call just to shield. An
+/// explicit policy that forbids revealing senders is refused; a looser one is accepted.
+fn shield_coinbase_privacy(v: Option<&Value>) -> Result<SendPrivacy, RpcError> {
+    let name = match v {
+        None | Some(Value::Null) => return Ok(SendPrivacy::AllowRevealedSenders),
+        Some(v) => v
+            .as_str()
+            .ok_or_else(|| RpcError::invalid_parameter("privacyPolicy must be a string"))?,
+    };
+    match name {
+        "AllowRevealedSenders" | "AllowLinkingAccountAddresses" => {
+            Ok(SendPrivacy::AllowRevealedSenders)
+        }
+        "AllowRevealedRecipients" => Ok(SendPrivacy::AllowRevealedRecipients),
+        "AllowFullyTransparent" | "NoPrivacy" => Ok(SendPrivacy::AllowFullyTransparent),
+        "FullPrivacy" | "AllowRevealedAmounts" | "LegacyCompat" => {
+            Err(RpcError::invalid_parameter(format!(
+                "The specified privacy policy, {name}, does not permit shielding \
+                 coinbase funds (which reveals the source addresses). Use \
+                 \"AllowRevealedSenders\" or a weaker policy."
+            )))
+        }
+        other => Err(RpcError::invalid_parameter(format!(
+            "Unknown privacy policy: {other}"
+        ))),
+    }
 }
 
 /// zcashd's default `transparent_limit` for `z_mergetoaddress`: at most this many transparent
@@ -5673,5 +5682,36 @@ mod tests {
         assert_eq!(balance(&only(Receiver::Sapling)), 100);
         assert_eq!(balance(&bare_sapling), 100);
         assert_eq!(balance(&all), 111, "a transparent receiver adds nothing");
+    }
+
+    /// Like zcashd, `z_shieldcoinbase` with no privacyPolicy uses AllowRevealedSenders, so a
+    /// pool needs no wallet-wide privacy setting to shield; an explicit policy is still checked.
+    #[test]
+    fn shield_coinbase_defaults_to_allow_revealed_senders() {
+        for omitted in [None, Some(json!(null))] {
+            assert_eq!(
+                shield_coinbase_privacy(omitted.as_ref()).unwrap(),
+                SendPrivacy::AllowRevealedSenders
+            );
+        }
+        assert_eq!(
+            shield_coinbase_privacy(Some(&json!("AllowFullyTransparent"))).unwrap(),
+            SendPrivacy::AllowFullyTransparent
+        );
+        for refused in [
+            "FullPrivacy",
+            "AllowRevealedAmounts",
+            "LegacyCompat",
+            "Bogus",
+        ] {
+            let e = shield_coinbase_privacy(Some(&json!(refused))).unwrap_err();
+            assert_eq!(
+                e.code,
+                crate::error::codes::RPC_INVALID_PARAMETER,
+                "{refused}"
+            );
+        }
+        let e = shield_coinbase_privacy(Some(&json!(3))).unwrap_err();
+        assert_eq!(e.code, crate::error::codes::RPC_INVALID_PARAMETER);
     }
 }

@@ -168,11 +168,11 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
         .await
         .expect("seed the chain");
 
-    // Transparent payouts need a policy that allows them: Miningcore pays t-addresses from the
-    // UA (revealed recipients) and s-nomp pays them from transparent funds (fully transparent).
+    // No privacy setting: both pool packages pass no policy, so this runs on zecd's defaults.
+    // z_shieldcoinbase defaults to AllowRevealedSenders like zcashd, and the default
+    // AllowRevealedRecipients lets the UA pay transparent miners.
     let mut cfg = ZecdConfig::new(zebrad.rpc_port, pick_port().expect("pick zecd rpc port"));
     cfg.transparent = true;
-    cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
     cfg.restore_mnemonic = Some(POOL_MNEMONIC.to_string());
     cfg.birthday = Some(BIRTHDAY);
     let zecd = Zecd::start(&cfg).await.expect("start zecd");

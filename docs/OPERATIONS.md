@@ -290,10 +290,10 @@ address (Ironwood once NU6.3 is active), and is paid out from there.
 - A zebra backend (`server = "zebra"`): the mining calls are forwarded to that node, and a
   lightwalletd backend has none to forward to.
 - Transparent receiving on the wallet: `[pools] transparent = true`.
-- A privacy policy that lets the pool shield coinbase (a revealed sender) and pay miners at
-  transparent addresses (revealed recipients). Pools do not pass a per-call policy, so set it in
-  config: `[spend] privacy_policy = "AllowFullyTransparent"`, which is what the regtest test of
-  these call shapes (`regtest_pool_compat`) runs with.
+- No privacy setting. `z_shieldcoinbase` with no privacyPolicy uses `AllowRevealedSenders`,
+  as zcashd does, whatever `[spend] privacy_policy` says. Paying miners' transparent addresses
+  from the unified address is allowed by the default policy (`AllowRevealedRecipients`). The
+  regtest test of these call shapes (`regtest_pool_compat`) runs on the default config.
 
 **Addresses.**
 - The coinbase address: `getnewaddress "" "transparent"`. Set it as the node's

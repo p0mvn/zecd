@@ -30,6 +30,9 @@ project adheres to [Semantic Versioning](https://semver.org).
   instead of refused with `-8`.** The ZIP 317 fee is still what is paid, and the requested fee
   is logged. A negative or non-numeric fee is refused (`-3`). `sendtoaddress`, `sendmany` and
   `settxfee` keep refusing fee instructions.
+- **`z_shieldcoinbase` with no privacyPolicy uses `AllowRevealedSenders`, as zcashd does**,
+  never the `[spend] privacy_policy` default, so a pool can shield coinbase without weakening
+  privacy for every other call. An explicit policy is checked as before.
 
 ## [0.10.0] - 2026-11-24
 
