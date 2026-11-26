@@ -3,6 +3,7 @@
 pub mod blockchain;
 pub mod control;
 pub mod network;
+pub mod node_passthrough;
 pub mod rawtx;
 pub mod signmessage;
 pub mod util;
@@ -39,6 +40,15 @@ pub const ALL_METHODS: &[&str] = &[
     "waitforblock",
     "waitforblockheight",
     "waitforsync",
+    // Node calls forwarded to the upstream node (mining pools)
+    "getblocktemplate",
+    "submitblock",
+    "getblock",
+    "getblocksubsidy",
+    "getmininginfo",
+    "getdifficulty",
+    "getnetworkhashps",
+    "getnetworksolps",
     // Utility
     "validateaddress",
     "signmessage",
@@ -52,6 +62,7 @@ pub const ALL_METHODS: &[&str] = &[
     "sendrawtransaction",
     // Wallet - reads
     "getbalance",
+    "z_getbalance",
     "getbalances",
     "getunconfirmedbalance",
     "getwalletinfo",
@@ -124,6 +135,15 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("waitforblock", 2),
     ("waitforblockheight", 2),
     ("waitforsync", 1),
+    // Node calls forwarded to the upstream node; zcashd's argument lists.
+    ("getblocktemplate", 1),
+    ("submitblock", 2),
+    ("getblock", 2),
+    ("getblocksubsidy", 1),
+    ("getmininginfo", 0),
+    ("getdifficulty", 0),
+    ("getnetworkhashps", 2),
+    ("getnetworksolps", 2),
     // Utility
     ("validateaddress", 1),
     ("settxfee", 1),
@@ -135,6 +155,7 @@ const MAX_POSITIONAL_ARGS: &[(&str, usize)] = &[
     ("sendrawtransaction", 2),
     // Wallet - reads
     ("getbalance", 4),
+    ("z_getbalance", 2),
     ("getbalances", 0),
     ("getunconfirmedbalance", 0),
     ("getwalletinfo", 0),
@@ -192,9 +213,9 @@ enum MethodCoins {
 
 /// The coins that serve each dispatched method.
 ///
-/// The ten `z_*` methods are Zcash-only (shielded sends, the shielding/merge sweeps, the
-/// async-operation trio, address validation, and zcashd's account address derivation); the
-/// other 46 are the
+/// The `z_*` methods are Zcash-only (shielded sends and balances, the shielding/merge sweeps,
+/// the async-operation trio, address validation, and zcashd's account address derivation); the
+/// rest are the
 /// Bitcoin-Core dialect zecd implements for any coin. Today every loaded wallet is Zcash, so
 /// the gate this table drives can never fire - it lands as machinery with live tests, so the
 /// PR that adds an engine changes data rather than dispatch.
@@ -222,6 +243,15 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("waitforblock", MethodCoins::All),
     ("waitforblockheight", MethodCoins::All),
     ("waitforsync", MethodCoins::All),
+    // Node calls forwarded to the upstream node
+    ("getblocktemplate", MethodCoins::All),
+    ("submitblock", MethodCoins::All),
+    ("getblock", MethodCoins::All),
+    ("getblocksubsidy", MethodCoins::All),
+    ("getmininginfo", MethodCoins::All),
+    ("getdifficulty", MethodCoins::All),
+    ("getnetworkhashps", MethodCoins::All),
+    ("getnetworksolps", MethodCoins::All),
     // Utility
     ("validateaddress", MethodCoins::All),
     ("estimatesmartfee", MethodCoins::All),
@@ -248,6 +278,7 @@ const METHOD_COINS: &[(&str, MethodCoins)] = &[
     ("listreceivedbyaddress", MethodCoins::All),
     ("getaddressinfo", MethodCoins::All),
     ("z_listtransactions", MethodCoins::Only(ZCASH_ONLY)),
+    ("z_getbalance", MethodCoins::Only(ZCASH_ONLY)),
     // Wallet - management (fleet onboarding). Bitcoin-dialect method names, so `All`: what is
     // engine-specific is the format of `createwallet`'s `ufvk` option, not the method itself.
     ("createwallet", MethodCoins::All),
@@ -399,6 +430,17 @@ async fn dispatch_zecd(
         "waitforblockheight" => blockchain::waitforblockheight(state, wallet, req).await,
         "waitforsync" => blockchain::waitforsync(state, wallet, req).await,
 
+        // Node calls, forwarded to the upstream node unchanged (mining pools send these to the
+        // same daemon as their wallet calls)
+        "getblocktemplate" => node_passthrough::forward(state, req).await,
+        "submitblock" => node_passthrough::forward(state, req).await,
+        "getblock" => node_passthrough::forward(state, req).await,
+        "getblocksubsidy" => node_passthrough::forward(state, req).await,
+        "getmininginfo" => node_passthrough::forward(state, req).await,
+        "getdifficulty" => node_passthrough::forward(state, req).await,
+        "getnetworkhashps" => node_passthrough::forward(state, req).await,
+        "getnetworksolps" => node_passthrough::forward(state, req).await,
+
         // Utility
         "validateaddress" => blocking(|| util::validateaddress(state, wallet, req)),
         "signmessage" => signmessage::signmessage(state, wallet, req).await,
@@ -414,6 +456,7 @@ async fn dispatch_zecd(
 
         // Wallet - reads
         "getbalance" => blocking(|| wallet_methods::getbalance(state, wallet, req)),
+        "z_getbalance" => blocking(|| wallet_methods::z_getbalance(state, wallet, req)),
         "getbalances" => blocking(|| wallet_methods::getbalances(state, wallet)),
         "getunconfirmedbalance" => {
             blocking(|| wallet_methods::getunconfirmedbalance(state, wallet))
@@ -579,7 +622,7 @@ mod tests {
             .iter()
             .filter(|(_, c)| *c != super::MethodCoins::All)
             .count();
-        assert_eq!(zcash_only, 11, "the Zcash-only surface is eleven methods");
+        assert_eq!(zcash_only, 12, "the Zcash-only surface is twelve methods");
     }
 
     #[test]

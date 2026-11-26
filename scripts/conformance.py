@@ -1159,11 +1159,18 @@ def main() -> int:
     # empty) *before* any send is spawned, so they move no money. addr is the wallet's own
     # address, so the fromaddress ownership check passes and later validation fires.
     try:
-        # An explicit fee is ZIP-317 -8, like the synchronous sends.
-        rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1"}], 1, 0.0001)
-        ck("z_sendmany fee raises", False)
+        # An explicit fee (Miningcore's fixed 0.0001) is accepted and the ZIP 317 fee is paid,
+        # so the call gets as far as the bogus privacy policy after it and fails there.
+        rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1"}], 1, 0.0001, "Bogus")
+        ck("z_sendmany fee then bogus policy raises", False)
     except JSONRPCException as e:
-        ck("z_sendmany fee -> code -8", e.code == -8, e.code)
+        ck("z_sendmany explicit fee is accepted (fails on the policy, -8)", e.code == -8, e.code)
+    try:
+        # A negative fee is still refused, as zcashd refuses it.
+        rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1"}], 1, -0.0001)
+        ck("z_sendmany negative fee raises", False)
+    except JSONRPCException as e:
+        ck("z_sendmany negative fee -> code -3", e.code == -3, e.code)
     try:
         rpc.call("z_sendmany", addr, [])
         ck("z_sendmany empty amounts raises", False)
@@ -1320,11 +1327,12 @@ def main() -> int:
     except JSONRPCException as e:
         ck("z_shieldcoinbase bad toaddress -> code -8", e.code == -8, e.code)
     try:
-        # An explicit fee is ZIP-317 -8, like every other send.
-        rpc.call("z_shieldcoinbase", "*", addr, 0.0001)
-        ck("z_shieldcoinbase fee raises", False)
+        # An explicit fee is accepted (the ZIP 317 fee is paid), so the call fails on the
+        # negative limit after it.
+        rpc.call("z_shieldcoinbase", "*", addr, 0.0001, -1)
+        ck("z_shieldcoinbase fee then negative limit raises", False)
     except JSONRPCException as e:
-        ck("z_shieldcoinbase fee -> code -8", e.code == -8, e.code)
+        ck("z_shieldcoinbase explicit fee is accepted (fails on the limit, -8)", e.code == -8, e.code)
     try:
         # zcashd: "Limit on maximum number of utxos cannot be negative".
         rpc.call("z_shieldcoinbase", "*", addr, None, -1)
@@ -1402,11 +1410,12 @@ def main() -> int:
     except JSONRPCException as e:
         ck("z_mergetoaddress bad toaddress -> code -8", e.code == -8, e.code)
     try:
-        # An explicit fee is ZIP-317 -8, like every send.
-        rpc.call("z_mergetoaddress", [addr], addr, 0.0001)
-        ck("z_mergetoaddress fee raises", False)
+        # An explicit fee is accepted (the ZIP 317 fee is paid), so the call fails on the
+        # negative limit after it.
+        rpc.call("z_mergetoaddress", [addr], addr, 0.0001, -1)
+        ck("z_mergetoaddress fee then negative limit raises", False)
     except JSONRPCException as e:
-        ck("z_mergetoaddress fee -> code -8", e.code == -8, e.code)
+        ck("z_mergetoaddress explicit fee is accepted (fails on the limit, -8)", e.code == -8, e.code)
     try:
         rpc.call("z_mergetoaddress", [addr], addr, None, -1)
         ck("z_mergetoaddress negative transparent_limit raises", False)

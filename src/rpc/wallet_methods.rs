@@ -691,6 +691,100 @@ pub(crate) fn getbalance(
     Ok(zats_to_value(info.total_spendable))
 }
 
+/// `z_getbalance <address> [minconf]` - zcashd's per-address balance, as mining-pool payout
+/// code reads it before paying out of that address.
+///
+/// - A transparent address: its unspent outputs with at least `minconf` confirmations (default
+///   1), the same rows `listunspent` reports, so immature coinbase is never counted.
+/// - A wallet-owned unified or Sapling address: the wallet's spendable balance in the pools that
+///   address can receive into (Sapling for a Sapling receiver; Orchard plus Ironwood for an
+///   Orchard receiver, since Ironwood notes are received on Orchard receivers). That is
+///   account-wide rather than per-diversified-address, which is what a send from the address
+///   can actually spend. Transparent funds are never counted, even for a UA carrying a
+///   transparent receiver. `minconf` follows `getbalance` (omitted keeps the wallet's policy).
+/// - Any other address: zcashd's `-5`.
+pub(crate) fn z_getbalance(
+    state: &AppState,
+    wallet: Option<&str>,
+    req: &RpcRequest,
+) -> Result<Value, RpcError> {
+    let addr = req.require_str(0, "z_getbalance requires an address")?;
+    let minconf = depth_param(req.param(1), "minconf", 1)?;
+    if minconf < 0 {
+        return Err(RpcError::invalid_parameter(
+            "Minimum number of confirmations cannot be less than 0",
+        ));
+    }
+    let handle = state.registry.get(wallet)?;
+    let Some(decoded) = crate::address::decode_on_network(&handle.network, addr) else {
+        return Err(RpcError::invalid_address_or_key(
+            "Invalid from address, should be a taddr or zaddr.",
+        ));
+    };
+    if let read::UaReceivers::Inconsistent(why) = read::classify_unified_receivers(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        addr,
+    ) {
+        return Err(RpcError::invalid_address_or_key(why));
+    }
+    if !read::is_mine(
+        handle.network,
+        &handle.engine_dir,
+        handle.account_scope(),
+        addr,
+    ) {
+        return Err(RpcError::invalid_address_or_key(
+            "From address does not belong to this node, spending key or viewing key not found.",
+        ));
+    }
+    let zats = if matches!(decoded, zcash_keys::address::Address::Transparent(_)) {
+        let st = handle.status();
+        let notes = read::list_unspent(handle.network, &handle.engine_dir, handle.account_scope())?;
+        transparent_balance_at(&notes, &st, addr, minconf)
+    } else {
+        let policy = minconf_policy(req.param(1), handle.confirmations)?;
+        let info = read::balance(
+            handle.network,
+            &handle.engine_dir,
+            handle.account_scope(),
+            policy,
+        )?;
+        shielded_balance_for(&decoded, &info)
+    };
+    Ok(zats_to_value(zats))
+}
+
+/// The unspent transparent value at `addr` with at least `minconf` confirmations.
+fn transparent_balance_at(
+    notes: &[read::UnspentNote],
+    st: &SyncStatus,
+    addr: &str,
+    minconf: i64,
+) -> u64 {
+    notes
+        .iter()
+        .filter(|n| n.pool == 0 && n.address.as_deref() == Some(addr))
+        .filter(|n| st.confirmations(n.mined_height) >= minconf)
+        .map(|n| n.value)
+        .sum()
+}
+
+/// The spendable shielded value an address can hold, from the wallet's balance: Sapling for a
+/// Sapling receiver, Orchard plus Ironwood for an Orchard receiver.
+fn shielded_balance_for(addr: &zcash_keys::address::Address, info: &read::BalanceInfo) -> u64 {
+    use zcash_protocol::PoolType;
+    let mut zats = 0;
+    if addr.can_receive_as(PoolType::SAPLING) {
+        zats += info.sapling_spendable;
+    }
+    if addr.can_receive_as(PoolType::ORCHARD) {
+        zats += info.orchard_spendable + info.ironwood_spendable;
+    }
+    zats
+}
+
 /// `getunconfirmedbalance` - value received but not yet spendable under the wallet's
 /// confirmations policy (incoming 0-conf payments surface here via the mempool stream).
 pub(crate) fn getunconfirmedbalance(
@@ -1150,6 +1244,48 @@ fn output_categories(from_account: bool, to_account: bool) -> &'static [&'static
     }
 }
 
+/// Bitcoin Core's category for an output a coinbase transaction paid the wallet, which mining
+/// pools read to decide whether a block they found still counts: `immature` until the output
+/// can be spent ([`read::COINBASE_MATURITY`] confirmations, the same depth `listunspent` and the
+/// balances use), `generate` after, and `orphan` once the block has left the chain. A coinbase
+/// is never in the mempool, so an unmined one has been reorged out. Zero confirmations on a
+/// mined coinbase only means the scan has not reached its block yet, so it reads `immature`,
+/// not `orphan`.
+fn coinbase_category(confirmations: i64, mined: bool) -> &'static str {
+    if confirmations < 0 || !mined {
+        "orphan"
+    } else if confirmations < i64::from(read::COINBASE_MATURITY) {
+        "immature"
+    } else {
+        "generate"
+    }
+}
+
+/// [`output_categories`] for one output of `tx`, with a coinbase's `receive` replaced by
+/// [`coinbase_category`].
+fn tx_output_categories(
+    tx: &read::TxRecord,
+    out: &read::TxOutputRecord,
+    confirmations: i64,
+) -> Vec<&'static str> {
+    let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
+    if !is_coinbase(tx) {
+        return categories.to_vec();
+    }
+    categories
+        .iter()
+        .map(|c| match *c {
+            "receive" => coinbase_category(confirmations, tx.mined_height.is_some()),
+            other => other,
+        })
+        .collect()
+}
+
+/// Whether `tx` is a coinbase: the first transaction in its block.
+fn is_coinbase(tx: &read::TxRecord) -> bool {
+    tx.tx_index == Some(0)
+}
+
 /// Per-transaction confirmation count: -1 for an expired unmined tx (it can never confirm;
 /// Bitcoin Core's "conflicted" signal, so pollers terminate), else anchored to the wallet's
 /// fully-scanned height.
@@ -1200,6 +1336,10 @@ fn push_wallet_tx_fields(entry: &mut Value, tx: &read::TxRecord, time: i64) {
             "trusted".into(),
             json!(!tx.expired_unmined && tx.account_balance_delta < 0),
         );
+    }
+    // Bitcoin Core marks every coinbase entry `generated`.
+    if is_coinbase(tx) {
+        obj.insert("generated".into(), json!(true));
     }
     obj.insert("walletconflicts".into(), json!([]));
     obj.insert("time".into(), json!(time));
@@ -1280,14 +1420,14 @@ fn tx_entries(
         if out.is_internal_change() {
             continue;
         }
-        let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
+        let categories = tx_output_categories(tx, out, confirmations);
         let address = display_address(network, out);
         // zecd is stateless and keeps no address labels; the field stays empty for Core shape
         // conformance, and a label filter for anything other than "" therefore matches nothing.
         if label_filter.is_some_and(|f| !f.is_empty()) {
             continue;
         }
-        for category in categories {
+        for category in &categories {
             let amount = if *category == "send" {
                 -out.value
             } else {
@@ -2087,11 +2227,11 @@ pub(crate) async fn gettransaction(
     )?
     .ok_or_else(|| RpcError::invalid_address_or_key("Invalid or non-wallet transaction id"))?;
 
-    let details = gettransaction_details(&handle.network, &rec);
+    let confirmations = tx_confirmations(&st, &rec);
+    let details = gettransaction_details(&handle.network, &rec, confirmations);
     let hex_str = gettransaction_hex(&handle, &rec).await;
 
     let amount = gettransaction_amount(rec.account_balance_delta, rec.fee_paid);
-    let confirmations = tx_confirmations(&st, &rec);
     let time = tx_time(&rec, handle.first_seen_of(txid));
     let mut obj = json!({
         "amount": signed_zats_to_value(amount),
@@ -2115,15 +2255,19 @@ pub(crate) async fn gettransaction(
 /// Build `gettransaction.details`: one entry per non-change output and category, sends
 /// negative - [`tx_entries`]'s conventions minus the per-tx fields (`confirmations`, `txid`,
 /// times), which `gettransaction` carries at the top level instead.
-fn gettransaction_details(network: &crate::network::ZNetwork, rec: &read::TxRecord) -> Vec<Value> {
+fn gettransaction_details(
+    network: &crate::network::ZNetwork,
+    rec: &read::TxRecord,
+    confirmations: i64,
+) -> Vec<Value> {
     let mut details = Vec::new();
     for out in &rec.outputs {
         if out.is_internal_change() {
             continue;
         }
-        let categories = output_categories(out.from_account.is_some(), out.to_account.is_some());
+        let categories = tx_output_categories(rec, out, confirmations);
         let address = display_address(network, out);
-        for category in categories {
+        for category in &categories {
             let amount = if *category == "send" {
                 -out.value
             } else {
@@ -2319,6 +2463,30 @@ fn param_engaged(v: &Value) -> bool {
         Value::Array(a) => !a.is_empty(),
         _ => true,
     }
+}
+
+/// Check the explicit `fee` argument of the zcashd-style async sends. zcashd lets the caller
+/// set the fee; zecd always pays the ZIP 317 fee instead. Rejecting the argument would break
+/// stock pool software (Miningcore passes a fixed 0.0001 ZEC on every payout), and paying
+/// exactly what such a caller asks would leave a large transaction underpaid and slow to mine.
+/// So a non-negative amount is accepted and logged, and the ZIP 317 fee is what is paid. A
+/// negative or non-numeric fee is still refused, as zcashd refuses it.
+///
+/// The Bitcoin-dialect sends (`sendtoaddress`, `sendmany`, `settxfee`) keep refusing any fee
+/// instruction: there a fee knob is a fee *rate*, which no caller should expect to be ignored.
+fn requested_fee(method: &str, v: Option<&Value>) -> Result<(), RpcError> {
+    let v = match v {
+        None | Some(Value::Null) => return Ok(()),
+        Some(v @ Value::Number(_)) => v,
+        Some(_) => return Err(RpcError::type_error("fee must be a number")),
+    };
+    let zats = value_to_zats(v)?;
+    tracing::info!(
+        method,
+        requested_fee_zats = zats,
+        "ignoring the requested fee; the ZIP 317 fee is paid instead"
+    );
+    Ok(())
 }
 
 /// The one shielded pool family a wallet-owned source address can hold notes in, or `None` when
@@ -2714,12 +2882,8 @@ pub(crate) fn z_sendmany(
         ));
     }
 
-    // fee (arg 3): ZIP-317 only - an explicit fee is rejected, never silently applied.
-    if req.param(3).is_some_and(param_engaged) {
-        return Err(RpcError::invalid_parameter(
-            "fee is not supported (fees are ZIP-317, computed by the wallet)",
-        ));
-    }
+    // fee (arg 3): accepted for zcashd compatibility, but the ZIP 317 fee is what is paid.
+    requested_fee("z_sendmany", req.param(3))?;
 
     // privacyPolicy (arg 4): per-call override of `[spend] privacy_policy`.
     let privacy = privacy_from_policy(
@@ -2907,13 +3071,8 @@ pub(crate) async fn z_shieldcoinbase(
         )));
     }
 
-    // fee (arg 2): ZIP-317 only - an explicit fee is rejected, never silently applied (same as
-    // z_sendmany).
-    if req.param(2).is_some_and(param_engaged) {
-        return Err(RpcError::invalid_parameter(
-            "fee is not supported (fees are ZIP-317, computed by the wallet)",
-        ));
-    }
+    // fee (arg 2): accepted for zcashd compatibility, but the ZIP 317 fee is what is paid.
+    requested_fee("z_shieldcoinbase", req.param(2))?;
 
     // limit (arg 3): max number of coinbase UTXOs to select, highest-value first. zcashd's
     // default is 50; 0 means "as many as fit in the transaction" (the block-space cap).
@@ -3214,12 +3373,8 @@ pub(crate) async fn z_mergetoaddress(
         .as_ref()
         .is_some_and(|a| !crate::address::has_shielded_receiver(a));
 
-    // fee (arg 2): ZIP-317 only - an explicit fee is rejected, never silently applied.
-    if req.param(2).is_some_and(param_engaged) {
-        return Err(RpcError::invalid_parameter(
-            "fee is not supported (fees are ZIP-317, computed by the wallet)",
-        ));
-    }
+    // fee (arg 2): accepted for zcashd compatibility, but the ZIP 317 fee is what is paid.
+    requested_fee("z_mergetoaddress", req.param(2))?;
 
     // transparent_limit (arg 3) / shielded_limit (arg 4): zcashd's per-call caps; 0 means "as
     // many as fit". Accepted (and ignored) for the source class they don't apply to, like
@@ -4946,7 +5101,7 @@ mod tests {
         assert_eq!(e[1]["memoStr"], json!("gm: self-send"));
 
         // gettransaction details agree.
-        let d = gettransaction_details(&NET, &t);
+        let d = gettransaction_details(&NET, &t, 1);
         assert_eq!(d.len(), 2, "self-payment details pair send+receive: {d:?}");
         assert_eq!(d[0]["category"], "send");
         assert_eq!(d[1]["category"], "receive");
@@ -5386,5 +5541,137 @@ mod tests {
         // Change outputs are filtered out (no entries).
         let c = tx_with(0x0c, Some(50), false, &[(true, true, 5, true, 0)]);
         assert!(z_tx_entries(&NET, &c, 1, 0).is_empty());
+    }
+
+    /// A coinbase reads `immature` until it can be spent, `generate` after, and `orphan` once
+    /// its block has left the chain. A mined coinbase the scan has not reached yet (zero
+    /// confirmations) is still immature, never orphaned.
+    #[test]
+    fn coinbase_category_follows_maturity() {
+        assert_eq!(coinbase_category(-1, true), "orphan");
+        assert_eq!(coinbase_category(5, false), "orphan");
+        assert_eq!(coinbase_category(0, true), "immature");
+        assert_eq!(coinbase_category(1, true), "immature");
+        assert_eq!(coinbase_category(99, true), "immature");
+        assert_eq!(coinbase_category(100, true), "generate");
+        assert_eq!(coinbase_category(5000, true), "generate");
+    }
+
+    /// The coinbase category reaches both `gettransaction.details` and the history entries, and
+    /// both carry `generated`; an ordinary receive is untouched.
+    #[test]
+    fn coinbase_receives_get_pool_categories_and_the_generated_flag() {
+        let coinbase = TxRecord {
+            tx_index: Some(0),
+            ..tx(
+                Some(100),
+                false,
+                None,
+                vec![out(false, true, 625_000_000, Some("t"), false)],
+            )
+        };
+        let d = gettransaction_details(&NET, &coinbase, 3);
+        assert_eq!(d[0]["category"], "immature");
+        let d = gettransaction_details(&NET, &coinbase, 100);
+        assert_eq!(d[0]["category"], "generate");
+        let e = tx_entries(&NET, &coinbase, 100, 0, None);
+        assert_eq!(e[0]["category"], "generate");
+        assert_eq!(e[0]["generated"], json!(true));
+
+        let ordinary = tx(
+            Some(100),
+            false,
+            None,
+            vec![out(false, true, 5, Some("ua"), false)],
+        );
+        let e = tx_entries(&NET, &ordinary, 100, 0, None);
+        assert_eq!(e[0]["category"], "receive");
+        assert!(e[0].get("generated").is_none());
+    }
+
+    /// An explicit fee on the zcashd-style sends is accepted when it is null or a non-negative
+    /// number (the ZIP 317 fee is paid regardless), and refused when negative or not a number.
+    #[test]
+    fn requested_fee_accepts_non_negative_numbers() {
+        for ok in [None, Some(json!(null)), Some(json!(0)), Some(json!(0.0001))] {
+            assert!(requested_fee("z_sendmany", ok.as_ref()).is_ok(), "{ok:?}");
+        }
+        for bad in [json!(-0.0001), json!("0.0001"), json!(true), json!([])] {
+            let e = requested_fee("z_sendmany", Some(&bad)).unwrap_err();
+            assert_eq!(e.code, crate::error::codes::RPC_TYPE_ERROR, "{bad}");
+        }
+    }
+
+    /// `z_getbalance` on a transparent address sums that address's unspent outputs at the
+    /// requested depth and nothing else.
+    #[test]
+    fn transparent_balance_counts_only_that_address_at_depth() {
+        let st = status(100);
+        let utxo = |addr: &str, mined: Option<u32>, value: u64, pool: i64| read::UnspentNote {
+            address: Some(addr.to_string()),
+            pool,
+            ..note(mined, value, false, None)
+        };
+        let notes = vec![
+            utxo("t1a", Some(91), 10, 0),  // 10 confirmations
+            utxo("t1a", Some(100), 20, 0), // 1 confirmation
+            utxo("t1a", None, 40, 0),      // unconfirmed
+            utxo("t1b", Some(91), 80, 0),  // another address
+            utxo("t1a", Some(91), 160, 3), // a shielded note recorded on the same string
+        ];
+        assert_eq!(transparent_balance_at(&notes, &st, "t1a", 1), 30);
+        assert_eq!(transparent_balance_at(&notes, &st, "t1a", 8), 10);
+        assert_eq!(transparent_balance_at(&notes, &st, "t1a", 0), 70);
+        assert_eq!(transparent_balance_at(&notes, &st, "t1c", 0), 0);
+    }
+
+    /// `z_getbalance` on a shielded address counts the pools its receivers can hold: Sapling for
+    /// a Sapling receiver, Orchard plus Ironwood for an Orchard one, never transparent value.
+    #[test]
+    fn shielded_balance_counts_the_pools_the_address_can_receive_into() {
+        use zcash_keys::keys::UnifiedAddressRequest;
+
+        let net = crate::network::ZNetwork::Test;
+        let mnemonic = <bip0039::Mnemonic<bip0039::English>>::from_phrase(
+            "mechanic vehicle helmet decide plug gorilla frost dial october \
+             midnight culture idea mountain fame park social drip bid doctor scatter glance defy \
+             moment stage",
+        )
+        .unwrap();
+        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &net,
+            &mnemonic.to_seed(""),
+            zip32::AccountId::try_from(0u32).unwrap(),
+        )
+        .unwrap()
+        .to_unified_full_viewing_key();
+        let all = ufvk
+            .address(
+                zip32::DiversifierIndex::from(0u32),
+                UnifiedAddressRequest::ALLOW_ALL,
+            )
+            .unwrap()
+            .encode(&net);
+        let only = |r: Receiver| {
+            crate::address::issued_encoding(&net, &all, &ReceiverSet::single(r)).unwrap()
+        };
+        let info = read::BalanceInfo {
+            orchard_spendable: 1,
+            ironwood_spendable: 10,
+            sapling_spendable: 100,
+            transparent_spendable: 1000,
+            ..Default::default()
+        };
+        let balance = |s: &str| {
+            shielded_balance_for(
+                &crate::address::decode_on_network(&net, s).expect("decodes"),
+                &info,
+            )
+        };
+        let bare_sapling = crate::address::single_receiver_for_pool(&net, &all, 2).unwrap();
+        assert_eq!(balance(&only(Receiver::Orchard)), 11);
+        assert_eq!(balance(&only(Receiver::Sapling)), 100);
+        assert_eq!(balance(&bare_sapling), 100);
+        assert_eq!(balance(&all), 111, "a transparent receiver adds nothing");
     }
 }

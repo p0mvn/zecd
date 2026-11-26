@@ -398,6 +398,7 @@ mod tests {
                 active: crate::state::ActiveCommands::default(),
                 operations: Arc::new(crate::operations::OperationRegistry::new()),
                 fleet: None,
+                node_hub: None,
                 spend_limits: crate::config::SpendLimits::new(
                     &crate::config::SpendConfig::default(),
                 ),
@@ -1287,6 +1288,7 @@ mod tests {
             r#"{"method":"getreceivedbyaddress","id":1,"params":["uaddr"]}"#,
             r#"{"method":"listreceivedbyaddress","id":1,"params":[]}"#,
             r#"{"method":"getbalances","id":1,"params":[]}"#,
+            r#"{"method":"z_getbalance","id":1,"params":["uaddr",8]}"#,
             r#"{"method":"getrawtransaction","id":1,"params":["00"]}"#,
             r#"{"method":"sendrawtransaction","id":1,"params":["00"]}"#,
             r#"{"method":"z_validateaddress","id":1,"params":["tmGqwWtL7RsbxikDSN26gsbicxVr2xJNe86"]}"#,
