@@ -1,16 +1,6 @@
-//! Mining-pool compatibility: the exact calls stock s-nomp and Miningcore send their wallet
-//! daemon, sent to zecd as that single daemon.
-//!
-//! Miningcore talks to one daemon for mining and payouts alike, so the node calls it needs
-//! (`getblocktemplate`, `submitblock`, `getblock`, ...) are forwarded by zecd to its node, and
-//! the wallet calls are zecd's own. The test walks a pool's life in that order: startup checks,
-//! block templates and submission, the coinbase ladder (`immature`, then `generate`), shielding
-//! the coinbase into Ironwood, the shielded balance check, a 50-recipient Miningcore payout with
-//! its hard-coded 0.0001 fee, and s-nomp's refill and transparent payout.
-//!
-//! zebra backend only: lightwalletd has no node JSON-RPC to forward the mining calls to, so this
-//! test is not in the zecd-lwd leg's list. The chain is mined to zecd from genesis with an
-//! address derived offline, for the reason `regtest_coinbase.rs` explains.
+//! Mining and payout RPC contracts exercised against a real node and wallet.
+//! Stock-client fee budgets and successful, fully funded payments are separate cases.
+//! Lightwalletd has no mining RPC; this suite runs on the Zebra and Zakura node legs.
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
@@ -89,7 +79,7 @@ async fn mine(zebrad: &Zebrad, zecd: &Zecd, blocks: u32) {
 
 /// Wait for an async operation the way Miningcore does: poll `z_getoperationresult [[opid]]`
 /// until it returns the finished operation, then take its txid.
-async fn operation_txid(zecd: &Zecd, opid: &str) -> String {
+async fn completed_operation(zecd: &Zecd, opid: &str) -> Value {
     let deadline = Instant::now() + OP_TIMEOUT;
     loop {
         let results = zecd
@@ -97,11 +87,7 @@ async fn operation_txid(zecd: &Zecd, opid: &str) -> String {
             .await
             .expect("z_getoperationresult");
         if let Some(op) = results.as_array().and_then(|a| a.first()) {
-            assert_eq!(op["status"], "success", "operation {opid} failed: {op}");
-            return op["result"]["txid"]
-                .as_str()
-                .expect("operation result txid")
-                .to_string();
+            return op.clone();
         }
         assert!(
             Instant::now() < deadline,
@@ -109,6 +95,59 @@ async fn operation_txid(zecd: &Zecd, opid: &str) -> String {
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+async fn operation_txid(zecd: &Zecd, opid: &str) -> String {
+    let op = completed_operation(zecd, opid).await;
+    assert_eq!(op["status"], "success", "{op}");
+    op["result"]["txid"]
+        .as_str()
+        .expect("successful transaction")
+        .to_owned()
+}
+
+/// Both clients can reserve only 10,000 zatoshis. Check the final wallet operation
+/// and the upstream mempool, since receiving an operation ID only acknowledges the request.
+async fn assert_fee_shortfall(zecd: &Zecd, node: &Zebrad, params: Value) {
+    let before = node.rpc("getrawmempool", json!([])).await.unwrap();
+    let opid = zecd.call("z_sendmany", params).await.unwrap();
+    let op = completed_operation(zecd, opid.as_str().unwrap()).await;
+    assert_eq!(op["status"], "failed", "{op}");
+    assert_eq!(op["error"]["code"], -6, "{op}");
+    assert!(op["result"]["txid"].is_null());
+    assert_eq!(node.rpc("getrawmempool", json!([])).await.unwrap(), before);
+}
+
+async fn wire_reply(cfg: &ZecdConfig, request: Value) -> String {
+    reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{}/", cfg.rpc_port))
+        .basic_auth(&cfg.rpc_user, Some(&cfg.rpc_password))
+        .json(&request)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .unwrap()
+        .error_for_status()
+        .unwrap()
+        .text()
+        .await
+        .unwrap()
+}
+
+async fn assert_balance_precision(cfg: &ZecdConfig) -> f64 {
+    let wire = wire_reply(cfg, json!({"method":"getbalance","params":[],"id":1})).await;
+    // s-nomp reads the digits between the decimal point and the first comma after result.
+    let amount = wire
+        .split_once("\"result\":")
+        .unwrap()
+        .1
+        .split(',')
+        .next()
+        .unwrap();
+    let decimals = amount.split_once('.').unwrap().1;
+    assert!(decimals.bytes().all(|b| b.is_ascii_digit()), "{wire}");
+    assert_eq!(10u64.pow(decimals.len() as u32), 100_000_000, "{wire}");
+    amount.parse().unwrap()
 }
 
 /// The first transaction (the coinbase) of the block at `height`.
@@ -140,10 +179,14 @@ async fn coinbase_category(zecd: &Zecd, txid: &str) -> Value {
 }
 
 #[tokio::test]
-async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
+async fn regtest_pool_rpc_contracts() {
     let Some(node_bin) = resolve_node_bin() else {
+        assert!(
+            std::env::var_os("ZECD_REGTEST_NODE").is_none(),
+            "a selected regtest node requires its executable (ZEBRAD_BIN or ZAKURAD_BIN)"
+        );
         eprintln!(
-            "SKIP regtest_pool_calls_work_against_zecd_as_the_only_daemon: set the node binary \
+            "SKIP regtest_pool_rpc_contracts: set the node binary \
              variable (ZEBRAD_BIN / ZAKURAD_BIN) to run it. The harness still compiled."
         );
         return;
@@ -160,7 +203,7 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
         .map(|i| derive_funder_transparent_address(i).expect("derive a worker address"))
         .collect();
 
-    let zebrad = Zebrad::start_with_miner(&node_bin, &pool_taddr)
+    let mut zebrad = Zebrad::start_with_miner(&node_bin, &pool_taddr)
         .await
         .expect("start the node");
     zebrad
@@ -175,7 +218,7 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
     cfg.transparent = true;
     cfg.restore_mnemonic = Some(POOL_MNEMONIC.to_string());
     cfg.birthday = Some(BIRTHDAY);
-    let zecd = Zecd::start(&cfg).await.expect("start zecd");
+    let mut zecd = Zecd::start(&cfg).await.expect("start zecd");
 
     let first_pool_block = node_tip(&zebrad).await + 1;
     zebrad
@@ -188,12 +231,19 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
         .await
         .expect("zecd sync");
 
+    assert_eq!(assert_balance_precision(&cfg).await, 0.0);
     // 1. Miningcore's startup batch and s-nomp's startup checks.
     let v = zecd
         .call("validateaddress", json!([pool_taddr]))
         .await
         .expect("validateaddress");
     assert_eq!(v["isvalid"], json!(true), "{v}");
+    assert_eq!(v["ismine"], true);
+    let foreign = zecd
+        .call("validateaddress", json!([workers[0]]))
+        .await
+        .unwrap();
+    assert_eq!(foreign["ismine"], false);
     let v = zecd
         .call("z_validateaddress", json!([pool_ua]))
         .await
@@ -208,15 +258,12 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
         json!(true),
         "the pool address is the wallet's: {v}"
     );
-    // Miningcore probes submitblock with no params and only checks the method exists.
+    // Miningcore probes submitblock with no params and expects the help error (-1).
     let e = zecd
         .call("submitblock", json!([]))
         .await
         .expect_err("submitblock with no block is refused by the node");
-    assert!(
-        e.code().is_some_and(|c| c != -32601),
-        "the node's own refusal, not method-not-found: {e}"
-    );
+    assert_eq!(e.code(), Some(-1), "stock mining clients require -1: {e}");
     zecd.call("getblockchaininfo", json!([]))
         .await
         .expect("getblockchaininfo");
@@ -308,12 +355,64 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
         .expect("submitblock through zecd");
     assert_eq!(submitted, json!("duplicate"), "the tip is already known");
 
+    // Build on the same parent on an isolated producer. Only zecd submits the
+    // fresh block to the wallet's node. Miningcore immediately looks it up in the batch.
+    let producer = Zebrad::start_with_miner(&node_bin, &pool_taddr)
+        .await
+        .unwrap();
+    for height in 1..=last_pool_block {
+        let hash = zebrad.rpc("getblockhash", json!([height])).await.unwrap();
+        let raw = zebrad.rpc("getblock", json!([hash, 0])).await.unwrap();
+        assert!(producer
+            .rpc("submitblock", json!([raw]))
+            .await
+            .unwrap()
+            .is_null());
+    }
+    producer.generate_blocks(1).await.unwrap();
+    let fresh = producer.rpc("getbestblockhash", json!([])).await.unwrap();
+    let raw = producer.rpc("getblock", json!([fresh, 0])).await.unwrap();
+    assert!(zebrad.rpc("getblock", json!([fresh])).await.is_err());
+    let batch: Value = serde_json::from_str(
+        &wire_reply(
+            &cfg,
+            json!([
+                {"id":1,"method":"submitblock","params":[raw]},
+                {"id":2,"method":"getblock","params":[fresh]}
+            ]),
+        )
+        .await,
+    )
+    .unwrap();
+    assert!(
+        batch[0]["error"].is_null() && batch[0]["result"].is_null(),
+        "{batch}"
+    );
+    assert_eq!(batch[0]["id"], 1);
+    assert_eq!(batch[1]["id"], 2);
+    assert_eq!(batch[1]["result"]["hash"], fresh);
+    assert_eq!(
+        zebrad.rpc("getbestblockhash", json!([])).await.unwrap(),
+        fresh
+    );
+    assert_eq!(
+        zecd.call("submitblock", json!([raw])).await.unwrap(),
+        "duplicate"
+    );
+    drop(producer);
+
     // 3. The coinbase ladder: immature until it can be spent, then generate.
     let first_coinbase = coinbase_txid_at(&zebrad, first_pool_block).await;
     assert_eq!(
         coinbase_category(&zecd, &first_coinbase).await,
         json!("immature")
     );
+    let tip = node_tip(&zebrad).await;
+    let at_99 = first_pool_block + u64::from(COINBASE_MATURITY) - 2;
+    mine(&zebrad, &zecd, (at_99 - tip) as u32).await;
+    assert_eq!(coinbase_category(&zecd, &first_coinbase).await, "immature");
+    mine(&zebrad, &zecd, 1).await;
+    assert_eq!(coinbase_category(&zecd, &first_coinbase).await, "generate");
     let tip = node_tip(&zebrad).await;
     // Mature every pool block: a coinbase spends at COINBASE_MATURITY confirmations.
     let target = last_pool_block + u64::from(COINBASE_MATURITY) - 1;
@@ -418,6 +517,16 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
         .iter()
         .map(|w| json!({ "address": w, "amount": PAYOUT_ZEC }))
         .collect();
+    let mut near_balance = recipients.clone();
+    let budget = zats(z_balance.as_f64().unwrap()) - zats(MININGCORE_FEE);
+    let other_payments = (MINER_PAYOUTS as u64 - 1) * zats(PAYOUT_ZEC);
+    near_balance[0]["amount"] = json!((budget - other_payments) as f64 / 1e8);
+    assert_fee_shortfall(
+        &zecd,
+        &zebrad,
+        json!([pool_ua, near_balance, PAYOUT_MINCONF, MININGCORE_FEE]),
+    )
+    .await;
     let opid = zecd
         .call(
             "z_sendmany",
@@ -468,6 +577,24 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
         .as_str()
         .expect("address")
         .to_string();
+    assert_eq!(
+        zecd.call("validateaddress", json!([t_payout]))
+            .await
+            .unwrap()["ismine"],
+        true
+    );
+    let balance = zecd
+        .call("z_getbalance", json!([pool_ua, 1]))
+        .await
+        .unwrap();
+    let sweep = (zats(balance.as_f64().unwrap()) - 10_000) as f64 / 1e8;
+    assert_fee_shortfall(
+        &zecd,
+        &zebrad,
+        json!([pool_ua, [{"address":t_payout,"amount":sweep}]]),
+    )
+    .await;
+    // A client that leaves enough for the transaction can refill the same address.
     let opid = zecd
         .call(
             "z_sendmany",
@@ -521,4 +648,55 @@ async fn regtest_pool_calls_work_against_zecd_as_the_only_daemon() {
     for w in workers.iter().take(3) {
         assert!(paid.contains(w.as_str()), "{w} is paid: {sent}");
     }
+    assert_ne!(assert_balance_precision(&cfg).await.fract(), 0.0);
+
+    // Create recent rewind checkpoints. Detach a reward and check the same record
+    // before and after restarting the wallet on the replacement chain.
+    for _ in 0..5 {
+        mine(&zebrad, &zecd, 1).await;
+    }
+    let old_height = node_tip(&zebrad).await;
+    let old_hash = zebrad.rpc("getbestblockhash", json!([])).await.unwrap();
+    let reward = coinbase_txid_at(&zebrad, old_height).await;
+    assert_eq!(coinbase_category(&zecd, &reward).await, "immature");
+    zebrad
+        .restart_with_miner(zecd_regtest_harness::ALT_MINER_ADDRESS)
+        .await
+        .unwrap();
+    if zebrad
+        .rpc("getblockhash", json!([old_height]))
+        .await
+        .ok()
+        .as_ref()
+        == Some(&old_hash)
+    {
+        zebrad
+            .rpc("invalidateblock", json!([old_hash]))
+            .await
+            .unwrap();
+    }
+    zebrad
+        .generate_blocks((old_height + 4 - node_tip(&zebrad).await) as u32)
+        .await
+        .unwrap();
+    zecd.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(coinbase_category(&zecd, &reward).await, "orphan");
+    zecd.restart(&cfg).await.unwrap();
+    zecd.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(coinbase_category(&zecd, &reward).await, "orphan");
+    let history = zecd
+        .call("listtransactions", json!(["*", 1000]))
+        .await
+        .unwrap();
+    assert!(history
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["txid"] == reward
+            && row["generated"] == true
+            && row["category"] == "orphan"));
 }

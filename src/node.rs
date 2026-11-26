@@ -734,7 +734,7 @@ impl Node {
             method = %req.method,
             wallet = wallet.unwrap_or("default")
         );
-        crate::rpc::dispatch(&self.state, wallet, &req)
+        crate::rpc::dispatch(&self.state, wallet, &req, None)
             .instrument(span)
             .await
     }

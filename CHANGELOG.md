@@ -8,7 +8,7 @@ project adheres to [Semantic Versioning](https://semver.org).
 ## [Unreleased]
 
 ### Added
-- **Mining pools can use zecd as their only daemon.** On a zebra backend, `getblocktemplate`,
+- **Mining RPC forwarding on a full-node backend.** On a zebra backend, `getblocktemplate`,
   `submitblock`, `getblock`, `getblocksubsidy`, `getmininginfo`, `getdifficulty`,
   `getnetworkhashps` and `getnetworksolps` are forwarded to the node unchanged. A node refusal
   keeps the node's own code and message; an unreachable node is a generic `-1` with the details
@@ -18,8 +18,8 @@ project adheres to [Semantic Versioning](https://semver.org).
   reports its unspent outputs at that depth; one of the wallet's unified or Sapling addresses
   reports the wallet's spendable balance in the pools that address can receive into (Orchard
   and Ironwood for an Orchard receiver).
-- **A regtest test of the exact calls s-nomp and Miningcore send** (`regtest_pool_compat`),
-  from block templates through a 50-recipient payout.
+- Pool RPC coverage includes block submission, funded payments, fee shortfalls and coinbase
+  history after a chain reorganization. See the client-specific limits in the operations guide.
 
 ### Changed
 - **`gettransaction`, `listtransactions` and `listsinceblock` label a coinbase receive the way
@@ -30,9 +30,10 @@ project adheres to [Semantic Versioning](https://semver.org).
   instead of refused with `-8`.** The ZIP 317 fee is still what is paid, and the requested fee
   is logged. A negative or non-numeric fee is refused (`-3`). `sendtoaddress`, `sendmany` and
   `settxfee` keep refusing fee instructions.
-- **`z_shieldcoinbase` with no privacyPolicy uses `AllowRevealedSenders`, as zcashd does**,
-  never the `[spend] privacy_policy` default, so a pool can shield coinbase without weakening
-  privacy for every other call. An explicit policy is checked as before.
+- `validateaddress` reports ownership for the selected wallet. HTTP balance responses place
+  the eight-decimal result first so s-nomp reads the correct number of zatoshis per ZEC.
+- The HTTP request limit is 4 MiB so a full-sized block fits in a submission batch. Forwarded
+  node calls accept named and positional parameters.
 
 ## [0.10.0] - 2026-11-24
 

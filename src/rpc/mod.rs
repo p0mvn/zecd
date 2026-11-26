@@ -345,6 +345,7 @@ pub(crate) async fn dispatch(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
+    named: Option<Value>,
 ) -> Result<Value, RpcError> {
     // RPC method safelist: when `[rpc] allowed_methods` is non-empty, ONLY those methods are
     // served. A blocked method is rejected exactly like one that does not exist (-32601 →
@@ -371,7 +372,7 @@ pub(crate) async fn dispatch(
             }
         }
     }
-    dispatch_zecd(state, wallet, req).await
+    dispatch_zecd(state, wallet, req, named).await
 }
 
 /// Run a synchronous handler without holding a runtime worker hostage.
@@ -405,6 +406,7 @@ async fn dispatch_zecd(
     state: &AppState,
     wallet: Option<&str>,
     req: &RpcRequest,
+    named: Option<Value>,
 ) -> Result<Value, RpcError> {
     match req.method.as_str() {
         // Control
@@ -432,14 +434,14 @@ async fn dispatch_zecd(
 
         // Node calls, forwarded to the upstream node unchanged (mining pools send these to the
         // same daemon as their wallet calls)
-        "getblocktemplate" => node_passthrough::forward(state, req).await,
-        "submitblock" => node_passthrough::forward(state, req).await,
-        "getblock" => node_passthrough::forward(state, req).await,
-        "getblocksubsidy" => node_passthrough::forward(state, req).await,
-        "getmininginfo" => node_passthrough::forward(state, req).await,
-        "getdifficulty" => node_passthrough::forward(state, req).await,
-        "getnetworkhashps" => node_passthrough::forward(state, req).await,
-        "getnetworksolps" => node_passthrough::forward(state, req).await,
+        "getblocktemplate" => node_passthrough::forward(state, req, named).await,
+        "submitblock" => node_passthrough::forward(state, req, named).await,
+        "getblock" => node_passthrough::forward(state, req, named).await,
+        "getblocksubsidy" => node_passthrough::forward(state, req, named).await,
+        "getmininginfo" => node_passthrough::forward(state, req, named).await,
+        "getdifficulty" => node_passthrough::forward(state, req, named).await,
+        "getnetworkhashps" => node_passthrough::forward(state, req, named).await,
+        "getnetworksolps" => node_passthrough::forward(state, req, named).await,
 
         // Utility
         "validateaddress" => blocking(|| util::validateaddress(state, wallet, req)),

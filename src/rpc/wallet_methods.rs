@@ -1283,7 +1283,7 @@ fn tx_output_categories(
 
 /// Whether `tx` is a coinbase: the first transaction in its block.
 fn is_coinbase(tx: &read::TxRecord) -> bool {
-    tx.tx_index == Some(0)
+    tx.tx_index == Some(0) || tx.detached_coinbase
 }
 
 /// Per-transaction confirmation count: -1 for an expired unmined tx (it can never confirm;
@@ -4350,6 +4350,7 @@ mod tests {
             block_time: mined.map(|_| 1_700_000_000),
             expired_unmined: expired,
             tx_index: mined.map(|_| 2),
+            detached_coinbase: false,
             block_hash: mined.map(|_| "cd".repeat(32)),
             created_time: None,
             outputs,
@@ -5424,6 +5425,7 @@ mod tests {
             block_time: mined.map(|h| 1_700_000_000 + i64::from(h)),
             expired_unmined: expired,
             tx_index: mined.map(|_| 1),
+            detached_coinbase: false,
             block_hash: mined.map(|_| "ee".repeat(32)),
             created_time: None,
             outputs,

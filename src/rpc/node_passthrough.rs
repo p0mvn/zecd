@@ -8,7 +8,7 @@
 //! What a caller sees:
 //! - the node's `result`, unchanged;
 //! - the node's own error code and message when the node refuses the call (Miningcore probes
-//!   `submitblock` with no params and only checks the code is not `-32601`);
+//!   `submitblock` with no params and expects `-1`);
 //! - a generic `-1` when the node could not be reached, with the details in the server log
 //!   only, since they name the node's address (the same rule as `From<anyhow::Error>` for
 //!   [`RpcError`]);
@@ -25,15 +25,23 @@ use crate::server::jsonrpc::RpcRequest;
 use crate::state::AppState;
 
 /// Forward `req` to the node behind the daemon's global `[backend]`.
-pub(crate) async fn forward(state: &AppState, req: &RpcRequest) -> Result<Value, RpcError> {
-    forward_via(state.node_hub.as_ref(), req).await
+pub(crate) async fn forward(
+    state: &AppState,
+    req: &RpcRequest,
+    named: Option<Value>,
+) -> Result<Value, RpcError> {
+    forward_via(state.node_hub.as_ref(), req, named).await
 }
 
-async fn forward_via(hub: Option<&Arc<ChainHub>>, req: &RpcRequest) -> Result<Value, RpcError> {
+async fn forward_via(
+    hub: Option<&Arc<ChainHub>>,
+    req: &RpcRequest,
+    named: Option<Value>,
+) -> Result<Value, RpcError> {
     let Some(hub) = hub else {
         return Err(RpcError::method_not_found(&req.method));
     };
-    let params = Value::Array(req.params.clone());
+    let params = named.unwrap_or_else(|| Value::Array(req.params.clone()));
     hub.passthrough(&req.method, params)
         .await
         .map_err(|e| to_rpc_error(&req.method, e))
@@ -112,16 +120,20 @@ mod tests {
     #[tokio::test]
     async fn the_node_result_is_returned_unchanged() {
         let hub = hub_at(fake_node().await);
-        let v = forward_via(Some(&hub), &call("getdifficulty", vec![]))
+        let v = forward_via(Some(&hub), &call("getdifficulty", vec![]), None)
             .await
             .unwrap();
         assert_eq!(v, json!(1.5));
         // Params go out exactly as the caller sent them.
-        let v = forward_via(Some(&hub), &call("getblock", vec![json!("ab"), json!(1)]))
-            .await
-            .unwrap();
+        let v = forward_via(
+            Some(&hub),
+            &call("getblock", vec![json!("ab"), json!(1)]),
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(v, json!({ "echo": ["ab", 1] }));
-        let v = forward_via(Some(&hub), &call("submitblock", vec![json!("00")]))
+        let v = forward_via(Some(&hub), &call("submitblock", vec![json!("00")]), None)
             .await
             .unwrap();
         assert_eq!(v, json!("duplicate"));
@@ -130,7 +142,7 @@ mod tests {
     #[tokio::test]
     async fn a_node_refusal_keeps_the_node_code_and_message() {
         let hub = hub_at(fake_node().await);
-        let e = forward_via(Some(&hub), &call("submitblock", vec![]))
+        let e = forward_via(Some(&hub), &call("submitblock", vec![]), None)
             .await
             .unwrap_err();
         assert_eq!(e.code, -32602);
@@ -145,7 +157,7 @@ mod tests {
             l.local_addr().unwrap()
         };
         let hub = hub_at(addr);
-        let e = forward_via(Some(&hub), &call("getmininginfo", vec![]))
+        let e = forward_via(Some(&hub), &call("getmininginfo", vec![]), None)
             .await
             .unwrap_err();
         assert_eq!(e.code, codes::RPC_MISC_ERROR);
@@ -159,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_node_means_method_not_found() {
-        let e = forward_via(None, &call("getblocktemplate", vec![]))
+        let e = forward_via(None, &call("getblocktemplate", vec![]), None)
             .await
             .unwrap_err();
         assert_eq!(e.code, codes::RPC_METHOD_NOT_FOUND);

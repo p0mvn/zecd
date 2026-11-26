@@ -1164,7 +1164,8 @@ def main() -> int:
         rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1"}], 1, 0.0001, "Bogus")
         ck("z_sendmany fee then bogus policy raises", False)
     except JSONRPCException as e:
-        ck("z_sendmany explicit fee is accepted (fails on the policy, -8)", e.code == -8, e.code)
+        ck("z_sendmany explicit fee is accepted (fails on the policy, -8)",
+           e.code == -8 and "Unknown privacy policy: Bogus" in str(e), str(e))
     try:
         # A negative fee is still refused, as zcashd refuses it.
         rpc.call("z_sendmany", addr, [{"address": addr, "amount": "0.1"}], 1, -0.0001)
@@ -1332,7 +1333,8 @@ def main() -> int:
         rpc.call("z_shieldcoinbase", "*", addr, 0.0001, -1)
         ck("z_shieldcoinbase fee then negative limit raises", False)
     except JSONRPCException as e:
-        ck("z_shieldcoinbase explicit fee is accepted (fails on the limit, -8)", e.code == -8, e.code)
+        ck("z_shieldcoinbase explicit fee is accepted (fails on the limit, -8)",
+           e.code == -8 and "Limit on maximum number of utxos cannot be negative" in str(e), str(e))
     try:
         # zcashd: "Limit on maximum number of utxos cannot be negative".
         rpc.call("z_shieldcoinbase", "*", addr, None, -1)
@@ -1415,7 +1417,8 @@ def main() -> int:
         rpc.call("z_mergetoaddress", [addr], addr, 0.0001, -1)
         ck("z_mergetoaddress fee then negative limit raises", False)
     except JSONRPCException as e:
-        ck("z_mergetoaddress explicit fee is accepted (fails on the limit, -8)", e.code == -8, e.code)
+        ck("z_mergetoaddress explicit fee is accepted (fails on the limit, -8)",
+           e.code == -8 and "Limit on maximum number of transparent inputs cannot be negative" in str(e), str(e))
     try:
         rpc.call("z_mergetoaddress", [addr], addr, None, -1)
         ck("z_mergetoaddress negative transparent_limit raises", False)

@@ -471,6 +471,8 @@ pub struct TxRecord {
     pub expired_unmined: bool,
     /// Position of the transaction within its block, when known (`blockindex`).
     pub tx_index: Option<u32>,
+    /// A detached transaction identified as coinbase from its stored inputs.
+    pub(crate) detached_coinbase: bool,
     /// Display-hex hash of the mining block, when scanned (`blockhash`).
     pub block_hash: Option<String>,
     /// Unix time the wallet created the transaction (librustzcash sets `created` only for
@@ -799,6 +801,7 @@ const TX_COLS: &str = concat!(
             ",
     expired_unmined_sql!(),
     " AS expired_unmined, v.tx_index,
+            CASE WHEN v.mined_height IS NULL AND v.tx_index IS NULL THEN t.raw END AS unmined_raw,
             b.hash AS block_hash,
             t.id_tx AS id_tx,
             CAST(strftime('%s', t.created) AS INTEGER) AS created_time"
@@ -828,6 +831,20 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
             block_time: row.get("block_time")?,
             expired_unmined: row.get("expired_unmined")?,
             tx_index: row.get("tx_index")?,
+            detached_coinbase: match row.get_ref("unmined_raw")? {
+                rusqlite::types::ValueRef::Blob(bytes) => {
+                    // The branch argument supplies pre-v5 signature context and has no
+                    // effect on decoding a transparent input. Later formats encode their branch.
+                    zcash_primitives::transaction::Transaction::read(
+                        bytes,
+                        zcash_protocol::consensus::BranchId::Sapling,
+                    )
+                    .ok()
+                    .and_then(|tx| tx.transparent_bundle().map(|bundle| bundle.is_coinbase()))
+                    .unwrap_or(false)
+                }
+                _ => false,
+            },
             block_hash: row
                 .get::<_, Option<Vec<u8>>>("block_hash")?
                 .map(|h| txid_display(&h)),
@@ -910,6 +927,7 @@ SELECT t.mined_height AS mined_height,
        t.expiry_height AS expiry_height,
        t.fee AS fee_paid,
        t.tx_index AS tx_index,
+       CASE WHEN t.mined_height IS NULL AND t.tx_index IS NULL THEN t.raw END AS unmined_raw,
        b.time AS block_time,
        b.hash AS block_hash,
        CAST(strftime('%s', t.created) AS INTEGER) AS created_time,
@@ -1160,6 +1178,7 @@ pub fn received_tx_records(
                 block_time: None,
                 expired_unmined,
                 tx_index,
+                detached_coinbase: false,
                 block_hash: None,
                 created_time: None,
                 outputs: Vec::new(),
@@ -2276,7 +2295,7 @@ mod tests {
                  account_uuid BLOB
              );
              CREATE TABLE blocks (height INTEGER, hash BLOB);
-             CREATE TABLE transactions (id_tx INTEGER, txid BLOB, created TEXT,
+             CREATE TABLE transactions (id_tx INTEGER, txid BLOB, created TEXT, raw BLOB,
                  -- Read by the `expired_unmined` expression in TX_COLS.
                  mined_height INTEGER, expiry_height INTEGER, target_height INTEGER,
                  min_observed_height INTEGER);",

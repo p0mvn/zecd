@@ -236,6 +236,7 @@ password = "change-me"
 #   "settxfee",                # inert stub (always returns -8)
 #
 #   # --- Mining pools (s-nomp, Miningcore) ---
+#   # See docs/OPERATIONS.md for client fee budgets and Miningcore block construction.
 #   # Node calls, forwarded unchanged to the zebra node in [backend] (lightwalletd: -32601).
 #   "getblocktemplate",
 #   "submitblock",             # relays caller-built blocks to the node

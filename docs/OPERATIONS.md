@@ -41,8 +41,8 @@ Know the assumptions so you can see when you are widening the trust boundary.
 **Node calls through zecd.** On a zebra backend, zecd forwards `getblocktemplate`,
 `submitblock`, `getblock`, `getblocksubsidy`, `getmininginfo`, `getdifficulty`,
 `getnetworkhashps` and `getnetworksolps` to the node unchanged, under zecd's own `[zebra]`
-credentials, so mining pools can use zecd as their only daemon. Any RPC caller can therefore ask
-the node for block templates and relay blocks to it. If that is more than a deployment needs,
+credentials. An authenticated caller with access to these methods can ask the node for block
+templates and relay blocks to it. If that is more than a deployment needs,
 leave those methods out of `[rpc] allowed_methods`. Node errors come back with the node's own
 code and message; a node that cannot be reached is a generic `-1`, with the details (which name
 the node's address) in zecd's log only. A lightwalletd backend answers `-32601`.
@@ -282,9 +282,17 @@ work-queue 503s; daemon restarts.
 
 ## Mining pools
 
-Stock s-nomp and Miningcore can use zecd as their only daemon, for mining and payouts alike.
-The pool's coinbase lands on a transparent address of zecd's wallet, is shielded into a unified
-address (Ironwood once NU6.3 is active), and is paid out from there.
+zecd can serve mining RPCs and wallet RPCs at one endpoint. The upstream node validates
+the block the pool submits. The wallet receives transparent coinbase rewards, shields
+mature rewards and pays recipients. Two client behaviors affect deployment:
+
+| Client revision | Behavior and operator action |
+| --- | --- |
+| [s-nomp e6498056](https://github.com/s-nomp/s-nomp/tree/e6498056547d77d684097fe3024eb47110177e30) | Its transparent-wallet refill subtracts only 0.0001 ZEC from the shielded balance. If ZIP 317 requires more, the operation ends with insufficient funds (`-6`) and sends nothing. Change the refill amount to leave enough for the transaction fee before enabling automatic refills. |
+| [Miningcore a553f623](https://github.com/oliverw/miningcore/tree/a553f62301f44c6df80891e408b6526d1dd98692) | A 50-recipient payout can succeed when the balance covers all outputs and the ZIP 317 fee. A near-balance payout reserving only 0.0001 ZEC can fail with `-6`. Its stock Zcash block builder also writes zero coinbase expiry height. On mainnet from NU5 onward the expiry height must equal the block height. Use a builder that satisfies the active consensus rules before mining. |
+
+For either client, poll the operation to completion and record the returned transaction ID
+before marking a payout as sent. The regtest covers node-built blocks and wallet payments.
 
 **Requirements.**
 - A zebra backend (`server = "zebra"`): the mining calls are forwarded to that node, and a
