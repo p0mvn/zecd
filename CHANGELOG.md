@@ -22,6 +22,12 @@ project adheres to [Semantic Versioning](https://semver.org).
   history after a chain reorganization. See the client-specific limits in the operations guide.
 
 ### Changed
+- **Under `AllowFullyTransparent`, `sendmany` and `sendtoaddress` fall back to shielded notes.**
+  A send to transparent recipients that names no source still pays from the wallet's
+  transparent funds first; when they fall short it is now paid from shielded notes, with
+  shielded change, instead of failing with `-6` while `listunspent` reports enough funds.
+- **Forwarded `getmininginfo` includes `difficulty`.** The node's answer is returned as before,
+  plus the node's `getdifficulty` when the node leaves the field out, as Zebra and Zakura do.
 - **`gettransaction`, `listtransactions` and `listsinceblock` identify mined rewards.**
   Transparent rewards report `immature` until the wallet scans 100 confirmations, then
   `generate`. Shielded rewards report `generate` immediately. Both report `orphan` after

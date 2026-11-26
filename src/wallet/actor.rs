@@ -6079,13 +6079,33 @@ impl WalletActor {
                 // A t-address `fromaddress` narrows the t->t selection to that address's UTXOs
                 // (coin control); `ANY_TADDR` and the source-less Bitcoin-dialect sends spend
                 // across every receiver, the pre-`SendSource` behaviour.
-                let from = match source {
-                    SendSource::Transparent(from) => from,
-                    _ => None,
+                let (from, named_source) = match source {
+                    SendSource::Transparent(from) => (from, true),
+                    _ => (None, false),
                 };
-                return self
+                let result = self
                     .do_send_transparent(recipients, confirmations, usk, account_id, from)
                     .await;
+                // A send that names no source (`sendmany`, `sendtoaddress`) may be paid from
+                // either kind of funds, and `listunspent` lists both. So when the transparent
+                // UTXOs alone fall short, pay it from shielded notes (with shielded change)
+                // instead of failing while the wallet reports enough funds. s-nomp depends on
+                // this: its balance check sums `listunspent`, and its move of shielded funds to
+                // its payout t-address only sometimes succeeds. When the shielded notes fall
+                // short too, the transparent error is the one returned, since it says what the
+                // transparent funds lack (for example, that they are coinbase to be shielded).
+                if named_source || !is_insufficient_funds(&result) {
+                    return result;
+                }
+                info!("transparent funds fall short for a source-less send; paying from shielded notes");
+                let shielded =
+                    Box::pin(self.do_send(request, confirmations, privacy, SendSource::Shielded))
+                        .await;
+                return if is_insufficient_funds(&shielded) {
+                    result
+                } else {
+                    shielded
+                };
             }
         }
         // A per-call `minconf` (z_sendmany) overrides the wallet-wide policy for this send's
@@ -8940,6 +8960,12 @@ fn classify_err(e: ProposalError) -> RpcError {
 /// safe: a `-6` means a proposal actually ran, which implies the chain tip is set (the
 /// `get_wallet_summary` progress-estimator underflow guarded against in `update_status`
 /// can't fire), and a failed lookup just leaves the message unenriched.
+/// Whether a send failed only because the chosen funds could not cover it (`-6`), as opposed to
+/// any other error, which must not be retried from another source.
+fn is_insufficient_funds<T>(result: &Result<T, RpcError>) -> bool {
+    matches!(result, Err(e) if e.code == codes::RPC_WALLET_INSUFFICIENT_FUNDS)
+}
+
 fn enrich_insufficient_funds(
     db: &WriteDb,
     engine_dir: &Path,

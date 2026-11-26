@@ -650,6 +650,75 @@ async fn regtest_pool_rpc_contracts() {
     }
     assert_ne!(assert_balance_precision(&cfg).await.fract(), 0.0);
 
+    // 9. s-nomp under the policy that lets `sendmany` spend transparent funds. Its balance check
+    //    sums `listunspent`, which lists transparent and shielded funds alike, so the payout must
+    //    succeed from either: from the refilled t-address while it covers the payout, and from
+    //    shielded notes once it does not, rather than failing with -6.
+    cfg.privacy_policy = Some("AllowFullyTransparent".to_string());
+    zecd.restart(&cfg)
+        .await
+        .expect("restart zecd with the transparent policy");
+    zecd.wait_until_synced_to_node(&zebrad, SYNC_TIMEOUT)
+        .await
+        .expect("zecd sync");
+    let small: serde_json::Map<String, Value> = [(workers[3].clone(), json!(PAYOUT_ZEC))]
+        .into_iter()
+        .collect();
+    let from_t = zecd
+        .call("sendmany", json!(["", small]))
+        .await
+        .expect("sendmany covered by transparent funds");
+    mine(&zebrad, &zecd, 1).await;
+    let raw = zebrad
+        .rpc("getrawtransaction", json!([from_t, 1]))
+        .await
+        .expect("node getrawtransaction");
+    assert!(
+        !raw["vin"].as_array().expect("vin").is_empty(),
+        "a payout the t-address covers is paid from it: {raw}"
+    );
+    mine(&zebrad, &zecd, 10).await;
+
+    // Everything a transparent send may spend: the refilled address and the transparent change
+    // of the payout above, but not coinbase, which only `z_shieldcoinbase` may spend.
+    let t_left: f64 = zecd
+        .call("listunspent", json!([1, 9_999_999]))
+        .await
+        .expect("listunspent")
+        .as_array()
+        .expect("unspent list")
+        .iter()
+        .filter(|u| u["pool"] == "transparent" && u["generated"] != true)
+        .filter_map(|u| u["amount"].as_f64())
+        .sum();
+    let large = ((zats(t_left) + zats(0.1)) as f64) / 1e8;
+    let shielded = zecd
+        .call("z_getbalance", json!([pool_ua, 1]))
+        .await
+        .unwrap()
+        .as_f64()
+        .unwrap();
+    assert!(
+        shielded > large + 0.01,
+        "the shielded notes cover a payout the t-address cannot: {shielded} vs {large}"
+    );
+    let large_amounts: serde_json::Map<String, Value> =
+        [(workers[4].clone(), json!(large))].into_iter().collect();
+    let from_z = zecd
+        .call("sendmany", json!(["", large_amounts]))
+        .await
+        .expect("sendmany falls back to shielded notes");
+    mine(&zebrad, &zecd, 1).await;
+    let raw = zebrad
+        .rpc("getrawtransaction", json!([from_z, 1]))
+        .await
+        .expect("node getrawtransaction");
+    assert_eq!(
+        raw["vin"].as_array().map(Vec::len),
+        Some(0),
+        "a payout the t-address cannot cover is paid from shielded notes: {raw}"
+    );
+
     // Create recent rewind checkpoints. Detach a reward and check the same record
     // before and after restarting the wallet on the replacement chain.
     for _ in 0..5 {

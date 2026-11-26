@@ -42,9 +42,33 @@ async fn forward_via(
         return Err(RpcError::method_not_found(&req.method));
     };
     let params = named.unwrap_or_else(|| Value::Array(req.params.clone()));
-    hub.passthrough(&req.method, params)
+    let mut result = hub
+        .passthrough(&req.method, params)
         .await
-        .map_err(|e| to_rpc_error(&req.method, e))
+        .map_err(|e| to_rpc_error(&req.method, e))?;
+    if req.method == "getmininginfo" {
+        add_missing_difficulty(hub, &mut result).await;
+    }
+    Ok(result)
+}
+
+/// zcashd's `getmininginfo` reports the network `difficulty`; Zebra's and Zakura's leave it
+/// out. s-nomp reads it from there for its network stats and fails every minute without it, so
+/// zecd fills it in from the node's `getdifficulty`. A node that already reports it is left
+/// alone, and if the extra call fails the node's answer is returned as it was.
+async fn add_missing_difficulty(hub: &Arc<ChainHub>, result: &mut Value) {
+    let Some(info) = result.as_object_mut() else {
+        return;
+    };
+    if info.contains_key("difficulty") {
+        return;
+    }
+    match hub.passthrough("getdifficulty", Value::Array(vec![])).await {
+        Ok(difficulty) => {
+            info.insert("difficulty".into(), difficulty);
+        }
+        Err(e) => tracing::debug!("getmininginfo: no difficulty from the node: {e:?}"),
+    }
 }
 
 /// How a forwarding failure reads to the RPC caller.
@@ -87,6 +111,10 @@ mod tests {
                     ok(json!({ "chain": "regtest", "blocks": 10, "bestblockhash": "00" }))
                 }
                 "getdifficulty" => ok(json!(1.5)),
+                "getmininginfo" if req["params"][0] == "has-difficulty" => {
+                    ok(json!({ "blocks": 10, "difficulty": 7.0 }))
+                }
+                "getmininginfo" => ok(json!({ "blocks": 10, "networksolps": 3 })),
                 "getblock" => ok(json!({ "echo": req["params"].clone() })),
                 "submitblock" if req["params"].as_array().is_none_or(|p| p.is_empty()) => {
                     err(-32602, "Invalid params: expected a block")
@@ -141,6 +169,27 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v, json!("duplicate"));
+    }
+
+    #[tokio::test]
+    async fn getmininginfo_gains_the_difficulty_the_node_leaves_out() {
+        let hub = hub_at(fake_node().await);
+        let v = forward_via(Some(&hub), &call("getmininginfo", vec![]), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            v,
+            json!({ "blocks": 10, "networksolps": 3, "difficulty": 1.5 })
+        );
+        // A node that reports its own difficulty keeps it.
+        let v = forward_via(
+            Some(&hub),
+            &call("getmininginfo", vec![json!("has-difficulty")]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(v["difficulty"], json!(7.0));
     }
 
     #[tokio::test]
