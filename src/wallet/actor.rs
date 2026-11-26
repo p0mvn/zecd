@@ -287,6 +287,38 @@ impl SendQueue {
         }
         self.pending.pop_front()
     }
+
+    /// Choose one unit of accepted work. Each completed step can start a proof or make a
+    /// queued payout spendable, so consult both queues again even after command ingress closes.
+    async fn next_shutdown_work(
+        &mut self,
+        commands: &mut mpsc::Receiver<WalletCommand>,
+        proofs: &mut mpsc::Receiver<SendCompletion>,
+        deadline: tokio::time::Instant,
+    ) -> Option<ShutdownWork> {
+        if tokio::time::Instant::now() >= deadline {
+            return None;
+        }
+        if self.proof_in_flight {
+            return tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(deadline) => None,
+                done = proofs.recv() => done
+                    .filter(|_| tokio::time::Instant::now() < deadline)
+                    .map(|done| ShutdownWork::Proof(Box::new(done))),
+            };
+        }
+        if let Some(send) = self.pop_ready() {
+            return Some(ShutdownWork::Payout(send));
+        }
+        commands.try_recv().ok().map(ShutdownWork::Command)
+    }
+}
+
+enum ShutdownWork {
+    Command(WalletCommand),
+    Payout(PendingSend),
+    Proof(Box<SendCompletion>),
 }
 
 /// A send whose prove+sign finished on a blocking thread, routed back to the actor so phase C
@@ -2580,7 +2612,7 @@ impl WalletActor {
         self.update_status();
 
         let mut more_work = true;
-        loop {
+        'actor: loop {
             // Exit between sync batches once shutdown is signalled, so Ctrl-C/`stop` doesn't
             // wait out a long catch-up scan and the DB connection is dropped cleanly.
             if *self.shutdown.borrow() {
@@ -2592,6 +2624,10 @@ impl WalletActor {
             // iteration (between sync batches) so the seed doesn't linger long past expiry; the
             // `select!` branch below handles the idle case, and `do_send` has a hard backstop.
             self.relock_if_expired();
+            if let Some(send) = self.send_queue.pop_ready() {
+                self.start_send_caught(send).await;
+                continue;
+            }
             // An explicit `waitforsync` nudge counts as work to do, so the pass runs now rather
             // than after up to a full `sync_interval` of idling. Consumed here so one nudge
             // buys exactly one pass.
@@ -2609,12 +2645,18 @@ impl WalletActor {
             if more_work {
                 // Commit any pipelined send whose proof just finished, before the next sync
                 // batch - phase C is short (store + bounded broadcast) and the caller is waiting.
-                // `finish_send_caught` pumps the send queue, so a deferred send starts promptly.
-                while let Ok(done) = self.send_done_rx.try_recv() {
+                if let Ok(done) = self.send_done_rx.try_recv() {
                     self.finish_send_caught(done).await;
                 }
                 // Service any queued commands first so writers aren't starved by sync.
                 loop {
+                    if *self.shutdown.borrow() {
+                        continue 'actor;
+                    }
+                    if let Some(send) = self.send_queue.pop_ready() {
+                        self.start_send_caught(send).await;
+                        continue;
+                    }
                     match self.cmd_rx.try_recv() {
                         Ok(cmd) => {
                             if self.handle_command_caught(cmd).await {
@@ -3705,72 +3747,34 @@ impl WalletActor {
 
     /// Finish the sends this wallet already accepted, before the actor stops.
     ///
-    /// The HTTP layer starts refusing new requests the moment shutdown is triggered, so
-    /// whatever is queued here is exactly the set of sends a client was told would happen. The
-    /// actor used to exit at the top of its loop and drop them: their reply channels closed and
-    /// the operations failed with "actor stopped". Nothing had been stored or broadcast for
-    /// those, so no funds were at risk and no transaction was half-created - but the operator
-    /// lost the record of which in-flight sends happened, on exactly the restart boundary where
-    /// the in-memory operation registry already makes that hardest to reconstruct.
-    ///
-    /// So: commit a pipelined send whose proof is still running, then run the commands already
-    /// buffered on the channel. Both are bounded by `[spend] shutdown_drain_secs`, since a send
-    /// waiting on an upstream that is also going away must not hold the daemon open; anything
-    /// left when it expires is dropped exactly as before, with a warning naming what was lost.
-    /// New commands cannot arrive to extend this - `try_recv` takes only what is already
-    /// buffered - so this drains a set that can only shrink.
-    ///
-    /// The bound is configuration rather than a constant because the value that matters is not
-    /// how long a proof takes but how long the *supervisor* lets the process live after its
-    /// stop signal, and the common defaults straddle any number picked here (systemd 90s,
-    /// Kubernetes 30s, `docker stop` 10s). A drain longer than that is cut short by SIGKILL and
-    /// buys nothing. `0` skips the drain entirely.
+    /// Close ingress and use one deadline for buffered commands, queued sends and proofs,
+    /// including proofs started by those commands. Once an inline payout or a proof commit
+    /// starts, let its store and broadcast path finish before checking the deadline again.
     async fn finish_accepted_sends(&mut self) {
-        let drain = self.shutdown_drain;
-        if drain.is_zero() {
-            return;
-        }
-        let deadline = Instant::now() + drain;
-        let mut finished = 0usize;
-
-        // A pipelined send is mid-proof on a blocking thread; its completion is the only thing
-        // that stores and broadcasts it.
-        while self.send_queue.proof_in_flight && Instant::now() < deadline {
-            match tokio::time::timeout_at(deadline.into(), self.send_done_rx.recv()).await {
-                Ok(Some(done)) => {
-                    self.finish_send_caught(done).await;
-                    finished += 1;
-                }
-                // The sender is gone, or the deadline passed: nothing more will arrive.
-                Ok(None) | Err(_) => break,
-            }
-        }
-
-        while Instant::now() < deadline {
-            match self.cmd_rx.try_recv() {
-                Ok(cmd) => {
+        self.cmd_rx.close();
+        let deadline = tokio::time::sleep(self.shutdown_drain).deadline();
+        while let Some(work) = self
+            .send_queue
+            .next_shutdown_work(&mut self.cmd_rx, &mut self.send_done_rx, deadline)
+            .await
+        {
+            match work {
+                ShutdownWork::Command(cmd) => {
                     if self.handle_command_caught(cmd).await {
-                        return;
+                        break;
                     }
-                    finished += 1;
                 }
-                Err(_) => break,
+                ShutdownWork::Payout(send) => self.start_send_caught(send).await,
+                ShutdownWork::Proof(done) => self.finish_send_caught(*done).await,
             }
         }
-
-        if finished > 0 {
-            info!(
-                commands = finished,
-                "finished accepted work before shutting down"
-            );
-        }
-        let abandoned =
-            self.send_queue.pending.len() + usize::from(self.send_queue.proof_in_flight);
-        if abandoned > 0 {
+        let queued_commands = self.cmd_rx.len();
+        let queued_sends = self.send_queue.pending.len();
+        let proof_in_flight = self.send_queue.proof_in_flight;
+        if queued_commands > 0 || queued_sends > 0 || proof_in_flight {
             warn!(
-                abandoned,
-                "shutting down with sends still unfinished after \
-                 {drain:?}; they were never broadcast"
+                queued_commands,
+                queued_sends, proof_in_flight, "wallet shut down with unfinished work"
             );
         }
     }
@@ -5229,7 +5233,6 @@ impl WalletActor {
                     source,
                     reply,
                 });
-                self.pump_send_queue().await;
             }
             WalletCommand::GetRawTx { txid, reply } => {
                 let res = self.do_get_raw_tx(txid).await;
@@ -6457,24 +6460,21 @@ impl WalletActor {
         self.send_queue.proof_in_flight = true;
     }
 
-    /// Inline sends finish here. A pipelined send resumes the queue when its proof is stored
-    /// or fails, so the next send always selects inputs against the updated wallet.
-    async fn pump_send_queue(&mut self) {
+    /// Isolate each payout so a panic cannot drop the remaining queue or stop the writer.
+    async fn start_send_caught(&mut self, send: PendingSend) {
         use futures_util::FutureExt as _;
-        while let Some(send) = self.send_queue.pop_ready() {
-            if std::panic::AssertUnwindSafe(self.start_send(send))
-                .catch_unwind()
-                .await
-                .is_err()
-            {
-                error!("queued send panicked; the actor continues");
-            }
+        if std::panic::AssertUnwindSafe(self.start_send(send))
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            error!("queued send panicked; the actor continues");
         }
     }
 
     /// Phase C of a pipelined send, on the actor: store the proven tx (marking inputs spent),
     /// reply to the caller, and broadcast. Clears `proof_in_flight` first so a panic mid-commit
-    /// can't wedge the pipeline (the loop pumps the queue afterwards).
+    /// can't wedge the pipeline.
     async fn finish_send(&mut self, done: SendCompletion) {
         self.send_queue.proof_in_flight = false;
         let SendCompletion {
@@ -6552,7 +6552,7 @@ impl WalletActor {
         Ok(txid)
     }
 
-    /// Run [`finish_send`](Self::finish_send) under panic isolation, then pump the send queue.
+    /// Run [`finish_send`](Self::finish_send) under panic isolation.
     /// Mirrors [`handle_command_caught`](Self::handle_command_caught): a panic on the commit path
     /// must not take the actor (and every wallet write) down. `proof_in_flight` is already cleared
     /// inside `finish_send`, so the queue can always make progress afterwards.
@@ -6569,7 +6569,6 @@ impl WalletActor {
             );
             self.send_queue.proof_in_flight = false;
         }
-        self.pump_send_queue().await;
     }
 
     /// Build, sign, record, and broadcast a **fully transparent** send: fund the payment directly
@@ -9043,6 +9042,151 @@ fn coinbase_hint(zats: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    fn queued_payout() -> super::PendingSend {
+        super::PendingSend {
+            request: super::TransactionRequest::empty(),
+            confirmations: None,
+            privacy: super::SendPrivacy::FullPrivacy,
+            source: super::SendSource::Unspecified,
+            reply: tokio::sync::oneshot::channel().0,
+        }
+    }
+
+    fn failed_proof() -> super::SendCompletion {
+        super::SendCompletion {
+            result: Err(super::RpcError::wallet("proof failed")),
+            orchard_circuit: None,
+            policy: Default::default(),
+            shape: Default::default(),
+            build_elapsed: Default::default(),
+            prove_elapsed: Default::default(),
+            reply: tokio::sync::oneshot::channel().0,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_rechecks_the_deadline_between_queued_payouts() {
+        use super::{SendQueue, ShutdownWork};
+        use tokio::time::{advance, Duration, Instant};
+
+        let (_, mut commands) = tokio::sync::mpsc::channel(1);
+        let (done, mut proofs) = tokio::sync::mpsc::channel(1);
+        let mut queue = SendQueue {
+            proof_in_flight: true,
+            ..Default::default()
+        };
+        queue.push(queued_payout());
+        queue.push(queued_payout());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        advance(Duration::from_secs(9)).await;
+        done.try_send(failed_proof()).unwrap();
+        assert!(matches!(
+            queue
+                .next_shutdown_work(&mut commands, &mut proofs, deadline)
+                .await,
+            Some(ShutdownWork::Proof(_))
+        ));
+        queue.proof_in_flight = false;
+        assert!(matches!(
+            queue
+                .next_shutdown_work(&mut commands, &mut proofs, deadline)
+                .await,
+            Some(ShutdownWork::Payout(_))
+        ));
+        // The first payout uses the remaining second. The second must never start.
+        advance(Duration::from_secs(1)).await;
+        assert!(queue
+            .next_shutdown_work(&mut commands, &mut proofs, deadline)
+            .await
+            .is_none());
+        assert_eq!(queue.pending.len(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_a_proof_started_by_the_last_buffered_command() {
+        use super::{SendQueue, ShutdownWork, WalletCommand};
+        use tokio::time::{sleep, Duration, Instant};
+
+        let (input, mut commands) = tokio::sync::mpsc::channel(1);
+        let (done, mut proofs) = tokio::sync::mpsc::channel(1);
+        let mut queue = SendQueue::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let send = queued_payout();
+        input
+            .try_send(WalletCommand::Send {
+                request: send.request,
+                confirmations: send.confirmations,
+                privacy: send.privacy,
+                source: send.source,
+                reply: send.reply,
+            })
+            .unwrap();
+        commands.close();
+        let Some(ShutdownWork::Command(WalletCommand::Send {
+            request,
+            confirmations,
+            privacy,
+            source,
+            reply,
+        })) = queue
+            .next_shutdown_work(&mut commands, &mut proofs, deadline)
+            .await
+        else {
+            panic!("expected the buffered payout command")
+        };
+        queue.push(super::PendingSend {
+            request,
+            confirmations,
+            privacy,
+            source,
+            reply,
+        });
+        assert!(matches!(
+            queue
+                .next_shutdown_work(&mut commands, &mut proofs, deadline)
+                .await,
+            Some(ShutdownWork::Payout(_))
+        ));
+        queue.proof_in_flight = true;
+        let (work, ()) = tokio::join!(
+            queue.next_shutdown_work(&mut commands, &mut proofs, deadline),
+            async {
+                sleep(Duration::from_secs(2)).await;
+                done.try_send(failed_proof()).unwrap();
+            },
+        );
+        assert!(matches!(work, Some(ShutdownWork::Proof(_))));
+        queue.proof_in_flight = false;
+        assert!(queue
+            .next_shutdown_work(&mut commands, &mut proofs, deadline)
+            .await
+            .is_none());
+        assert!(Instant::now() < deadline);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_spends_only_the_remaining_time_waiting_for_a_proof() {
+        use super::SendQueue;
+        use tokio::time::{advance, Duration, Instant};
+
+        let (_, mut commands) = tokio::sync::mpsc::channel(1);
+        let (_done, mut proofs) = tokio::sync::mpsc::channel(1);
+        let mut queue = SendQueue {
+            proof_in_flight: true,
+            ..Default::default()
+        };
+        queue.push(queued_payout());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        advance(Duration::from_secs(9)).await;
+        assert!(queue
+            .next_shutdown_work(&mut commands, &mut proofs, deadline)
+            .await
+            .is_none());
+        assert_eq!(Instant::now(), deadline);
+        assert!(queue.proof_in_flight);
+        assert_eq!(queue.pending.len(), 1);
+    }
+
     #[test]
     fn overlapping_sends_wait_in_order_with_their_original_policies() {
         use super::{

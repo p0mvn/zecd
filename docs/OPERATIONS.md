@@ -444,9 +444,10 @@ signal arriving in that window used to discard the send: nothing had been broadc
 were at risk, but the record of whether it happened was lost - on exactly the restart boundary
 where the in-memory operation registry makes that hardest to reconstruct.
 
-On shutdown the wallet now finishes what it has already accepted, bounded by `[spend]
-shutdown_drain_secs` (default 60). Set it **below your supervisor's own stop timeout**, because
-that is what actually bounds it:
+On shutdown, buffered commands, queued payouts, and their proofs share one deadline set by
+`[spend] shutdown_drain_secs` (default 60). At the deadline the wallet stops starting payouts
+and waiting for proofs. A payout already executing inline, or a proof already being stored and
+broadcast, finishes its current operation. Leave room for that in your supervisor's stop timeout.
 
 | supervisor | default grace period | setting to raise |
 |---|---|---|

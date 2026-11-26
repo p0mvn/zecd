@@ -22,6 +22,8 @@ project adheres to [Semantic Versioning](https://semver.org).
   history after a chain reorganization. See the client-specific limits in the operations guide.
 
 ### Changed
+- Queued payouts and proof completions share one shutdown deadline, including proofs started
+  by a buffered payout while the wallet is stopping.
 - Wallet rewinds now remember which disconnected transactions were mined rewards, including
   shielded receipts scanned with memo fetching disabled. Reward history preserves the
   receiving address index across the rewind and restart.
