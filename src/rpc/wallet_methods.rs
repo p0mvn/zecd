@@ -2716,8 +2716,23 @@ pub(crate) async fn sendmany(
             state.config.spend.privacy,
             SendSource::Unspecified,
         )
-        .await?;
+        .await
+        .map_err(sendmany_error)?;
     Ok(send_result(txid.to_string(), verbose))
+}
+
+/// s-nomp recognizes a retryable payout shortfall by both code and case-sensitive message.
+fn sendmany_error(mut error: RpcError) -> RpcError {
+    if error.code == crate::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS
+        && !error.message.contains("insufficient funds")
+    {
+        if error.message.starts_with("Insufficient funds") {
+            error.message.replace_range(..1, "i");
+        } else {
+            error.message.insert_str(0, "insufficient funds: ");
+        }
+    }
+    error
 }
 
 // ---- Asynchronous operations (zcashd-style `z_sendmany` + `z_getoperation*`) ----
@@ -3717,6 +3732,28 @@ mod tests {
     use super::*;
     use crate::pools::Receiver;
     use crate::wallet::read::{TxOutputRecord, TxRecord};
+
+    #[test]
+    fn sendmany_preserves_the_shortfall_reason_and_other_errors() {
+        for (reason, expected) in [
+            ("Insufficient funds: fee", "insufficient funds: fee"),
+            ("insufficient funds", "insufficient funds"),
+            (
+                "no eligible inputs",
+                "insufficient funds: no eligible inputs",
+            ),
+        ] {
+            let error = sendmany_error(RpcError::insufficient_funds(reason));
+            assert_eq!(
+                error.code,
+                crate::error::codes::RPC_WALLET_INSUFFICIENT_FUNDS
+            );
+            assert_eq!(error.message, expected);
+        }
+        let error = sendmany_error(RpcError::wallet("wallet locked"));
+        assert_eq!(error.code, crate::error::codes::RPC_WALLET_ERROR);
+        assert_eq!(error.message, "wallet locked");
+    }
 
     // History-display tests use fake recipient strings that don't decode as Zcash addresses,
     // so `display_address`'s single-receiver reduction is a no-op and the recorded string is

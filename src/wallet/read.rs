@@ -1,7 +1,7 @@
 //! Read-only wallet queries served from short-lived connections, so they never block on the
 //! sync writer (SQLite WAL gives consistent snapshots).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::anyhow;
@@ -843,8 +843,7 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
             block_time: row.get("block_time")?,
             expired_unmined: row.get("expired_unmined")?,
             tx_index: row.get("tx_index")?,
-            detached_coinbase: row.get::<_, bool>("known_reward")?
-                || raw_is_coinbase(row.get_ref("unmined_raw")?),
+            detached_coinbase: is_detached_reward(row)?,
             block_hash: row
                 .get::<_, Option<Vec<u8>>>("block_hash")?
                 .map(|h| txid_display(&h)),
@@ -853,6 +852,11 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
             raw: None,
         },
     ))
+}
+
+/// A rewind recorded locally or a retained raw coinbase can identify an orphaned reward.
+fn is_detached_reward(row: &rusqlite::Row<'_>) -> rusqlite::Result<bool> {
+    Ok(row.get::<_, bool>("known_reward")? || raw_is_coinbase(row.get_ref("unmined_raw")?))
 }
 
 /// After a rewind clears the block index, the null transparent prevout identifies a coinbase.
@@ -1771,8 +1775,7 @@ pub fn list_unspent(
         // with `generated = true`.
         let sql = format!(
             "SELECT t.txid, txo.output_index, txo.value_zat, txo.address,
-                    (IFNULL(t.tx_index, 1) == 0) AS generated,
-                    CASE WHEN t.mined_height IS NULL AND t.tx_index IS NULL THEN t.raw END AS unmined_raw
+                    (IFNULL(t.tx_index, 1) == 0) AS generated
              FROM transparent_received_outputs txo
              JOIN transactions t ON t.id_tx = txo.transaction_id
              WHERE (t.mined_height IS NOT NULL OR ({unexpired_t}))
@@ -1790,10 +1793,6 @@ pub fn list_unspent(
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(named_params! { ":target_height": target })?;
         while let Some(row) = rows.next()? {
-            // A zero-expiry detached reward passes the expiry predicate but can never be spent.
-            if raw_is_coinbase(row.get_ref("unmined_raw")?) {
-                continue;
-            }
             let txid: Vec<u8> = row.get(0)?;
             let vout = row.get(1)?;
             let value: i64 = row.get(2)?;
@@ -1813,18 +1812,22 @@ pub fn list_unspent(
             });
         }
 
-        // Rewinds retain shielded note rows, so both the wallet selector and the
-        // unconfirmed-output queries can return a disconnected reward.
-        let mut stmt = conn.prepare(
-            "SELECT r.txid FROM zecd_detached_rewards r JOIN transactions t ON t.txid = r.txid
-             WHERE t.mined_height IS NULL",
-        )?;
-        let detached = stmt
-            .query_map([], |row| Ok(txid_display(&row.get::<_, Vec<u8>>(0)?)))?
-            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
-        if !detached.is_empty() {
-            out.retain(|note| !detached.contains(&note.txid));
+        // A wallet upgraded after a rewind may have only the raw coinbase to identify the
+        // orphan. Check this once per transaction across all pools, including selector results.
+        let columns = detached_reward_columns!();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT t.txid, {columns} FROM transactions t
+             WHERE t.mined_height IS NULL
+               AND (known_reward OR (unmined_raw IS NOT NULL AND ({unexpired_t})))"
+        ))?;
+        let mut rows = stmt.query(named_params! { ":target_height": target })?;
+        let mut detached = HashSet::new();
+        while let Some(row) = rows.next()? {
+            if is_detached_reward(row)? {
+                detached.insert(txid_display(row.get_ref(0)?.as_blob()?));
+            }
         }
+        out.retain(|note| !detached.contains(&note.txid));
     }
     Ok(out)
 }

@@ -712,6 +712,18 @@ async fn regtest_pool_rpc_contracts() {
         shielded > large + 0.01,
         "the shielded notes cover a payout the t-address cannot: {shielded} vs {large}"
     );
+    // A payout for the full shielded balance leaves nothing for its fee. The transparent
+    // funds are smaller still. s-nomp retries only this exact code and case-sensitive text.
+    let shortfall = zecd
+        .call("sendmany", json!(["", { (workers[4].as_str()): shielded }]))
+        .await
+        .expect_err("the full balance cannot cover both payout and fee");
+    assert_eq!(shortfall.code(), Some(-6), "{shortfall}");
+    assert!(
+        shortfall.to_string().contains("insufficient funds"),
+        "{shortfall}"
+    );
+
     let large_amounts: serde_json::Map<String, Value> =
         [(workers[4].clone(), json!(large))].into_iter().collect();
     let from_z = zecd

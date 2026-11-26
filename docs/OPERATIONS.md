@@ -289,7 +289,7 @@ mature rewards and pays recipients. Two client behaviors affect deployment:
 
 | Client revision | Behavior and operator action |
 | --- | --- |
-| [s-nomp e6498056](https://github.com/s-nomp/s-nomp/tree/e6498056547d77d684097fe3024eb47110177e30) | Its transparent-wallet refill subtracts only 0.0001 ZEC from the shielded balance. If ZIP 317 requires more, the operation ends with insufficient funds (`-6`) and sends nothing. Change the refill amount to leave enough for the transaction fee before enabling automatic refills. Its payment processor replaces an `orphan` category with `immature` when confirmations are below its threshold. Preserve `orphan` before applying the depth check so disconnected rounds can be retired. [Payment processor](https://github.com/s-nomp/s-nomp/blob/e6498056547d77d684097fe3024eb47110177e30/libs/paymentProcessor.js#L795-L809) Its payouts call `sendmany ""`, and its balance check sums `listunspent`, which lists transparent and shielded funds. Under the default privacy policy zecd pays such a send from shielded notes only, so funds a successful refill moved to the payout t-address stay there unused. Set `[spend] privacy_policy = "AllowFullyTransparent"` for an s-nomp wallet: `sendmany` then pays from the transparent funds while they cover the payout and from shielded notes when they do not. Sends that name a source, such as `z_sendmany` from the pool's unified address, are not affected. |
+| [s-nomp e6498056](https://github.com/s-nomp/s-nomp/tree/e6498056547d77d684097fe3024eb47110177e30) | Its transparent-wallet refill subtracts only 0.0001 ZEC from the shielded balance. If ZIP 317 requires more, the operation ends with insufficient funds (`-6`) and sends nothing. Change the refill amount to leave enough for the transaction fee before enabling automatic refills. Its payment processor replaces an `orphan` category with `immature` when confirmations are below its threshold. Preserve `orphan` before applying the depth check so disconnected rounds can be retired. [Payment processor](https://github.com/s-nomp/s-nomp/blob/e6498056547d77d684097fe3024eb47110177e30/libs/paymentProcessor.js#L795-L809) Its payouts call `sendmany ""`, and its balance check sums `listunspent`, which lists transparent and shielded funds. Under the default privacy policy zecd pays such a send from shielded notes only, so funds a successful refill moved to the payout t-address stay there unused. Set `[spend] privacy_policy = "AllowFullyTransparent"` on the daemon serving s-nomp: `sendmany` then pays from the transparent funds while they cover the payout and from shielded notes when they do not. Sends that name a source, such as `z_sendmany` from the pool's unified address, are not affected. |
 | [Miningcore a553f623](https://github.com/oliverw/miningcore/tree/a553f62301f44c6df80891e408b6526d1dd98692) | A 50-recipient payout can succeed when the balance covers all outputs and the ZIP 317 fee. A near-balance payout reserving only 0.0001 ZEC can fail with `-6`. |
 
 Both stock block builders leave the coinbase expiry height at zero. On mainnet from NU5
@@ -306,7 +306,9 @@ before marking a payout as sent. The regtest covers node-built blocks and wallet
 - Miningcore can pay transparent recipients from its unified address with the default
   `AllowRevealedRecipients` policy. For s-nomp to spend the transparent payout address it
   refills, set `[spend] privacy_policy = "AllowFullyTransparent"`. This makes the payout's
-  transparent inputs and change public. Both clients can use `z_shieldcoinbase` with its
+  transparent inputs and change public. The setting applies to every wallet served by that
+  daemon. Run the pool wallet on a separate zecd instance if other wallets need a different
+  default privacy policy. Both clients can use `z_shieldcoinbase` with its
   default policy.
 
 **Addresses.**

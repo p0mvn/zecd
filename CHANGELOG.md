@@ -30,6 +30,10 @@ project adheres to [Semantic Versioning](https://semver.org).
   A send to transparent recipients that names no source still pays from the wallet's
   transparent funds first; when they fall short it is now paid from shielded notes, with
   shielded change, instead of failing with `-6` while `listunspent` reports enough funds.
+  A `sendmany` shortfall includes the lowercase `insufficient funds` message s-nomp checks
+  before retrying a payout with a fee allowance.
+- `listunspent` also excludes shielded rewards disconnected before a wallet upgrade when
+  the wallet retained the raw coinbase transaction.
 - **Forwarded `getmininginfo` includes `difficulty`.** The node's answer is returned as before,
   plus the node's `getdifficulty` when the node leaves the field out, as Zebra and Zakura do.
 - **`gettransaction`, `listtransactions` and `listsinceblock` identify mined rewards.**
