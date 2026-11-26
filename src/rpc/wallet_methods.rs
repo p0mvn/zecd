@@ -1445,14 +1445,8 @@ fn tx_entries(
                 "txid": tx.txid_hex,
                 "bip125-replaceable": "no",
             });
-            // zecd extension, `receive` entries only: the diversifier index of the own address
-            // this output landed on. Keyed on the category, not on `to_account`, so the send
-            // half of a self-transfer pair stays index-free like every other send. Read from the address row the note links to, so it costs
-            // nothing and is identical after a from-seed restore. It is the stateless identity
-            // every encoding of an address shares - a consumer that stored the index at issuance
-            // (`z_getaddressforaccount` returns it, `getaddressinfo` reads it back) matches
-            // receipts by integer with no address parsing at all.
-            if *category == "receive" {
+            // The address index identifies any receipt, including a mined or detached reward.
+            if *category != "send" {
                 if let Some(index) = out.diversifier_index {
                     entry["diversifier_index"] = json!(index);
                 }
@@ -2283,14 +2277,8 @@ fn gettransaction_details(
                 // zecd is stateless and keeps no address labels; retained empty for Core shape.
                 "label": "",
             });
-            // zecd extension, `receive` entries only: the diversifier index of the own address
-            // this output landed on. Keyed on the category, not on `to_account`, so the send
-            // half of a self-transfer pair stays index-free like every other send. Read from the address row the note links to, so it costs
-            // nothing and is identical after a from-seed restore. It is the stateless identity
-            // every encoding of an address shares - a consumer that stored the index at issuance
-            // (`z_getaddressforaccount` returns it, `getaddressinfo` reads it back) matches
-            // receipts by integer with no address parsing at all.
-            if *category == "receive" {
+            // The address index identifies any receipt, including a mined or detached reward.
+            if *category != "send" {
                 if let Some(index) = out.diversifier_index {
                     d["diversifier_index"] = json!(index);
                 }
@@ -5579,9 +5567,13 @@ mod tests {
                 vec![
                     TxOutputRecord {
                         pool: 0,
+                        diversifier_index: Some(7),
                         ..out(false, true, 625_000_000, Some("t"), false)
                     },
-                    out(false, true, 500, Some("ua"), false),
+                    TxOutputRecord {
+                        diversifier_index: Some(9),
+                        ..out(false, true, 500, Some("ua"), false)
+                    },
                 ],
             )
         };
@@ -5593,6 +5585,16 @@ mod tests {
         let e = tx_entries(&NET, &coinbase, 100, 0, None);
         assert_eq!(e[0]["category"], "generate");
         assert_eq!(e[0]["generated"], json!(true));
+
+        for conf in [3, 100, -1] {
+            for rows in [
+                gettransaction_details(&NET, &coinbase, conf),
+                tx_entries(&NET, &coinbase, conf, 0, None),
+            ] {
+                assert_eq!(rows[0]["diversifier_index"], 7);
+                assert_eq!(rows[1]["diversifier_index"], 9);
+            }
+        }
 
         let ordinary = tx(
             Some(100),

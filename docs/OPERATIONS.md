@@ -40,8 +40,9 @@ Know the assumptions so you can see when you are widening the trust boundary.
 
 **Node calls through zecd.** On a zebra backend, zecd forwards `getblocktemplate`,
 `submitblock`, `getblock`, `getblocksubsidy`, `getmininginfo`, `getdifficulty`,
-`getnetworkhashps` and `getnetworksolps` to the node unchanged, under zecd's own `[zebra]`
-credentials. An authenticated caller with access to these methods can ask the node for block
+`getnetworkhashps` and `getnetworksolps` to the node under zecd's own `[zebra]`
+credentials. When the node omits `getmininginfo.difficulty`, zecd requests it with
+`getdifficulty` for pool statistics. An authenticated caller with access to these methods can ask the node for block
 templates and relay blocks to it. If that is more than a deployment needs,
 leave those methods out of `[rpc] allowed_methods`. Node errors come back with the node's own
 code and message; a node that cannot be reached is a generic `-1`, with the details (which name
@@ -302,10 +303,11 @@ before marking a payout as sent. The regtest covers node-built blocks and wallet
 - A zebra backend (`server = "zebra"`): the mining calls are forwarded to that node, and a
   lightwalletd backend has none to forward to.
 - Transparent receiving on the wallet: `[pools] transparent = true`.
-- No privacy setting. `z_shieldcoinbase` with no privacyPolicy uses `AllowRevealedSenders`,
-  as zcashd does, whatever `[spend] privacy_policy` says. Paying miners' transparent addresses
-  from the unified address is allowed by the default policy (`AllowRevealedRecipients`). The
-  regtest test of these call shapes (`regtest_pool_compat`) runs on the default config.
+- Miningcore can pay transparent recipients from its unified address with the default
+  `AllowRevealedRecipients` policy. For s-nomp to spend the transparent payout address it
+  refills, set `[spend] privacy_policy = "AllowFullyTransparent"`. This makes the payout's
+  transparent inputs and change public. Both clients can use `z_shieldcoinbase` with its
+  default policy.
 
 **Addresses.**
 - The coinbase address: `getnewaddress "" "transparent"`. Set it as the node's

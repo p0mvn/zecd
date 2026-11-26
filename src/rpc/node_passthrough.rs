@@ -6,7 +6,7 @@
 //! node on the daemon's `[backend]` connection and returns the node's answer as is.
 //!
 //! What a caller sees:
-//! - the node's `result`, unchanged;
+//! - the node's `result`, with missing mining difficulty filled from `getdifficulty` when available;
 //! - the node's own error code and message when the node refuses the call (Miningcore probes
 //!   `submitblock` with no params and expects `-1`);
 //! - a generic `-1` when the node could not be reached, with the details in the server log
@@ -244,9 +244,18 @@ mod tests {
         assert_eq!(e.code, codes::RPC_METHOD_NOT_FOUND);
     }
 
-    #[test]
-    fn a_lightwalletd_backend_answers_method_not_found() {
-        let e = to_rpc_error("getblocktemplate", PassthroughError::Unsupported);
+    #[tokio::test]
+    async fn offline_lightwalletd_answers_method_not_found_without_dialing() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let server =
+            crate::backend::resolve(&format!("http://{addr}"), crate::network::ZNetwork::Main)
+                .unwrap();
+        let hub = ChainHub::new(server, Duration::from_secs(5));
+        let e = forward_via(Some(&hub), &call("getblocktemplate", vec![]), None)
+            .await
+            .unwrap_err();
         assert_eq!(e.code, codes::RPC_METHOD_NOT_FOUND);
     }
 

@@ -184,7 +184,8 @@ impl Client<'_> {
         self.call_typed("getblocksubsidy", params).await
     }
 
-    /// `getmininginfo`: forwarded to the node.
+    /// `getmininginfo`: node mining statistics, including difficulty when the node provides it
+    /// through this call or `getdifficulty`.
     pub async fn get_mining_info(&self) -> Result<Value, ClientError> {
         self.call_typed("getmininginfo", vec![]).await
     }

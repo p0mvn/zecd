@@ -295,7 +295,11 @@ async fn regtest_pool_rpc_contracts() {
         .call("getmininginfo", json!([]))
         .await
         .expect("getmininginfo");
-    assert!(mining.is_object(), "{mining}");
+    assert!(mining["difficulty"].is_number(), "{mining}");
+    assert_eq!(
+        mining["difficulty"],
+        zebrad.rpc("getdifficulty", json!([])).await.unwrap()
+    );
     zecd.call("getnetworkinfo", json!([]))
         .await
         .expect("getnetworkinfo");
@@ -602,11 +606,22 @@ async fn regtest_pool_rpc_contracts() {
         )
         .await
         .expect("s-nomp z_sendmany");
-    operation_txid(&zecd, opid.as_str().expect("opid")).await;
+    let refill_txid = operation_txid(&zecd, opid.as_str().expect("opid")).await;
     mine(&zebrad, &zecd, 10).await;
 
-    // 8. s-nomp's payout from transparent funds. It must never spend a coinbase output
-    //    directly: consensus requires that spend to be fully shielded.
+    let refill_outputs = zecd
+        .call("listunspent", json!([1, 9_999_999, [t_payout]]))
+        .await
+        .unwrap();
+    let refill_vout = refill_outputs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["txid"] == refill_txid)
+        .and_then(|u| u["vout"].as_u64())
+        .expect("the confirmed refill pays the payout address");
+
+    // The default policy pays the transparent workers from shielded notes.
     let mut amounts = serde_json::Map::new();
     for w in workers.iter().take(3) {
         amounts.insert(w.clone(), json!(PAYOUT_ZEC));
@@ -621,19 +636,10 @@ async fn regtest_pool_rpc_contracts() {
         .rpc("getrawtransaction", json!([txid, 1]))
         .await
         .expect("node getrawtransaction");
-    for input in raw["vin"].as_array().into_iter().flatten() {
-        let Some(prev) = input["txid"].as_str() else {
-            continue;
-        };
-        let prev_tx = zebrad
-            .rpc("getrawtransaction", json!([prev, 1]))
-            .await
-            .expect("node getrawtransaction of an input");
-        assert!(
-            prev_tx["vin"][0].get("coinbase").is_none(),
-            "sendmany spent a coinbase output: {raw}"
-        );
-    }
+    assert!(
+        raw["vin"].as_array().unwrap().is_empty(),
+        "the default payout uses shielded inputs: {raw}"
+    );
     let sent = zecd
         .call("gettransaction", json!([txid]))
         .await
@@ -674,8 +680,12 @@ async fn regtest_pool_rpc_contracts() {
         .await
         .expect("node getrawtransaction");
     assert!(
-        !raw["vin"].as_array().expect("vin").is_empty(),
-        "a payout the t-address covers is paid from it: {raw}"
+        raw["vin"]
+            .as_array()
+            .expect("vin")
+            .iter()
+            .any(|input| input["txid"] == refill_txid && input["vout"] == refill_vout),
+        "the transparent payout spends the exact refill output: {raw}"
     );
     mine(&zebrad, &zecd, 10).await;
 

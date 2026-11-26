@@ -1932,6 +1932,11 @@ fn orphaned_receipt_reads_and_expires() {
                 want(txid),
                 "tip {tip} gettransaction: expired_unmined of {txid}"
             );
+            assert_eq!(
+                rec.detached_coinbase,
+                txid == &orphan,
+                "only the reward with a cleared block position is a detached coinbase"
+            );
         }
     };
 

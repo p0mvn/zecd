@@ -10,7 +10,7 @@ project adheres to [Semantic Versioning](https://semver.org).
 ### Added
 - **Mining RPC forwarding on a full-node backend.** On a zebra backend, `getblocktemplate`,
   `submitblock`, `getblock`, `getblocksubsidy`, `getmininginfo`, `getdifficulty`,
-  `getnetworkhashps` and `getnetworksolps` are forwarded to the node unchanged. A node refusal
+  `getnetworkhashps` and `getnetworksolps` are forwarded to the node. A node refusal
   keeps the node's own code and message; an unreachable node is a generic `-1` with the details
   in the log only; a lightwalletd backend answers `-32601`. `[rpc] allowed_methods` can leave
   them out. `docs/OPERATIONS.md` has a "Mining pools" section for s-nomp and Miningcore.
@@ -22,6 +22,10 @@ project adheres to [Semantic Versioning](https://semver.org).
   history after a chain reorganization. See the client-specific limits in the operations guide.
 
 ### Changed
+- Wallet rewinds now remember which disconnected transactions were mined rewards, including
+  shielded receipts scanned with memo fetching disabled. Reward history preserves the
+  receiving address index across the rewind and restart.
+- Mining RPCs on a lightwalletd backend return method-not-found even while it is offline.
 - **Under `AllowFullyTransparent`, `sendmany` and `sendtoaddress` fall back to shielded notes.**
   A send to transparent recipients that names no source still pays from the wallet's
   transparent funds first; when they fall short it is now paid from shielded notes, with

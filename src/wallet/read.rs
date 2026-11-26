@@ -471,7 +471,7 @@ pub struct TxRecord {
     pub expired_unmined: bool,
     /// Position of the transaction within its block, when known (`blockindex`).
     pub tx_index: Option<u32>,
-    /// A detached transaction identified as coinbase from its stored inputs.
+    /// A detached reward identified by its former block position or its stored inputs.
     pub(crate) detached_coinbase: bool,
     /// Display-hex hash of the mining block, when scanned (`blockhash`).
     pub block_hash: Option<String>,
@@ -791,6 +791,17 @@ macro_rules! expired_unmined_sql {
 /// The `expired_unmined_sql!` expression, for statements assembled at run time.
 const EXPIRED_UNMINED_SQL: &str = expired_unmined_sql!();
 
+/// Both history queries use the position recorded at rewind. Older wallets can also
+/// identify a detached coinbase from its raw transaction when that payload was stored.
+macro_rules! detached_reward_columns {
+    () => {
+        "CASE WHEN t.mined_height IS NULL THEN EXISTS (
+             SELECT 1 FROM zecd_detached_rewards r WHERE r.txid = t.txid
+         ) ELSE 0 END AS known_reward,
+         CASE WHEN t.mined_height IS NULL AND t.tx_index IS NULL THEN t.raw END AS unmined_raw"
+    };
+}
+
 /// The column list shared by [`list_transactions`] and [`get_transaction`]: `v_transactions`
 /// joined with the mining block's hash and the raw `transactions` row's `created` timestamp
 /// (set only for wallet-authored sends; stored as `yyyy-MM-dd HH:mm:ss.fffffffzzz`, which
@@ -800,8 +811,9 @@ const TX_COLS: &str = concat!(
             v.fee_paid, v.block_time,
             ",
     expired_unmined_sql!(),
-    " AS expired_unmined, v.tx_index,
-            CASE WHEN v.mined_height IS NULL AND v.tx_index IS NULL THEN t.raw END AS unmined_raw,
+    " AS expired_unmined, v.tx_index, ",
+    detached_reward_columns!(),
+    ",
             b.hash AS block_hash,
             t.id_tx AS id_tx,
             CAST(strftime('%s', t.created) AS INTEGER) AS created_time"
@@ -831,7 +843,8 @@ fn tx_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<i64>, TxReco
             block_time: row.get("block_time")?,
             expired_unmined: row.get("expired_unmined")?,
             tx_index: row.get("tx_index")?,
-            detached_coinbase: raw_is_coinbase(row.get_ref("unmined_raw")?),
+            detached_coinbase: row.get::<_, bool>("known_reward")?
+                || raw_is_coinbase(row.get_ref("unmined_raw")?),
             block_hash: row
                 .get::<_, Option<Vec<u8>>>("block_hash")?
                 .map(|h| txid_display(&h)),
@@ -931,8 +944,9 @@ SELECT t.mined_height AS mined_height,
        t.txid AS txid,
        t.expiry_height AS expiry_height,
        t.fee AS fee_paid,
-       t.tx_index AS tx_index,
-       CASE WHEN t.mined_height IS NULL AND t.tx_index IS NULL THEN t.raw END AS unmined_raw,
+       t.tx_index AS tx_index, ",
+    detached_reward_columns!(),
+    ",
        b.time AS block_time,
        b.hash AS block_hash,
        CAST(strftime('%s', t.created) AS INTEGER) AS created_time,
@@ -1798,6 +1812,19 @@ pub fn list_unspent(
                 generated,
             });
         }
+
+        // Rewinds retain shielded note rows, so both the wallet selector and the
+        // unconfirmed-output queries can return a disconnected reward.
+        let mut stmt = conn.prepare(
+            "SELECT r.txid FROM zecd_detached_rewards r JOIN transactions t ON t.txid = r.txid
+             WHERE t.mined_height IS NULL",
+        )?;
+        let detached = stmt
+            .query_map([], |row| Ok(txid_display(&row.get::<_, Vec<u8>>(0)?)))?
+            .collect::<rusqlite::Result<std::collections::HashSet<_>>>()?;
+        if !detached.is_empty() {
+            out.retain(|note| !detached.contains(&note.txid));
+        }
     }
     Ok(out)
 }
@@ -2301,7 +2328,8 @@ mod tests {
                  account_uuid BLOB
              );
              CREATE TABLE blocks (height INTEGER, hash BLOB);
-             CREATE TABLE transactions (id_tx INTEGER, txid BLOB, created TEXT, raw BLOB,
+             CREATE TABLE zecd_detached_rewards(txid BLOB PRIMARY KEY);
+             CREATE TABLE transactions (id_tx INTEGER, txid BLOB, created TEXT, raw BLOB, tx_index INTEGER,
                  -- Read by the `expired_unmined` expression in TX_COLS.
                  mined_height INTEGER, expiry_height INTEGER, target_height INTEGER,
                  min_observed_height INTEGER);",

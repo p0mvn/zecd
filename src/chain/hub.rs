@@ -53,7 +53,7 @@ use zcash_client_backend::proto::service;
 use zcash_protocol::consensus::BlockHeight;
 use zcash_protocol::{ShieldedPool, TxId};
 
-use crate::backend::Server;
+use crate::backend::{Server, ServerKind};
 use crate::chain::{
     AbortOnDrop, AnySource, BroadcastOutcome, ChainSource, ChainTip, CompactBlockStream, FetchedTx,
     MempoolStream, PassthroughError, ServerInfo, SubtreeRootInfo, TxEvidence,
@@ -209,6 +209,9 @@ impl ChainHub {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, PassthroughError> {
+        if self.server.kind() == ServerKind::Lightwalletd {
+            return Err(PassthroughError::Unsupported);
+        }
         let source = self.acquire().await.map_err(PassthroughError::Transport)?;
         let result = source.inner.passthrough(method, params).await;
         if let Err(PassthroughError::Transport(_)) = &result {
